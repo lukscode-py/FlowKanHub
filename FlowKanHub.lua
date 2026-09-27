@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.31"
+    Flow.Version = "1.14.37"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -77,6 +77,14 @@ local Flow = {Build = "bundled"}
         print("[" .. self.Name .. "] " .. tostring(message))
     end
 
+    -- Global, safe entry point for all Hub modules. It queues a styled visual
+    -- notification when the UI is ready and otherwise safely retains it.
+    function Flow:Notify(options)
+        local notifications = self.Features and self.Features.Notifications
+        if notifications and notifications.Push then return notifications:Push(options) end
+        return false, "notifications_unavailable"
+    end
+
     function Flow:Track(connection)
         table.insert(self.Runtime.connections, connection)
         return connection
@@ -116,6 +124,8 @@ local Flow = {Build = "bundled"}
         if raid and raid.Shutdown then pcall(function() raid:Shutdown() end) end
         local raidMonitor = self.Features and self.Features.RaidMonitor
         if raidMonitor and raidMonitor.Shutdown then pcall(function() raidMonitor:Shutdown() end) end
+        local notifications = self.Features and self.Features.Notifications
+        if notifications and notifications.Shutdown then pcall(function() notifications:Shutdown() end) end
         self:DisconnectAll()
         if self.Runtime.gui and self.Runtime.gui.Parent then
             self.Runtime.gui:Destroy()
@@ -212,6 +222,9 @@ end)(Flow)
         layoutWidth = 620,
         layoutHeight = 440,
         layoutScale = 1,
+        -- Central notification presentation. Default is lower-right.
+        notificationPosition = "bottom_right",
+        notificationStyle = "modern",
         language = "en",
         isTeleporting = false,
         isCollecting = false,
@@ -335,6 +348,10 @@ end)(Flow)
         if type(data.layoutWidth) == "number" then state.layoutWidth = math.max(480, math.min(1000, data.layoutWidth)) end
         if type(data.layoutHeight) == "number" then state.layoutHeight = math.max(340, math.min(720, data.layoutHeight)) end
         if type(data.layoutScale) == "number" then state.layoutScale = math.max(0.8, math.min(1.25, data.layoutScale)) end
+        local notificationPositions = { bottom_right = true, bottom_left = true, top_right = true, top_left = true }
+        local notificationStyles = { modern = true, glass = true, compact = true }
+        if type(data.notificationPosition) == "string" and notificationPositions[data.notificationPosition] then state.notificationPosition = data.notificationPosition end
+        if type(data.notificationStyle) == "string" and notificationStyles[data.notificationStyle] then state.notificationStyle = data.notificationStyle end
         if type(data.language) == "string" and (not Flow.Language or Flow.Language.Translations[data.language]) then
             state.language = data.language
         end
@@ -389,6 +406,8 @@ end)(Flow)
             layoutWidth = state.layoutWidth,
             layoutHeight = state.layoutHeight,
             layoutScale = state.layoutScale,
+            notificationPosition = state.notificationPosition,
+            notificationStyle = state.notificationStyle,
             language = state.language,
             ballPosition = state.ballPosition,
             hubPosition = state.hubPosition,
@@ -3107,6 +3126,19 @@ end)(Flow)
         observedAnchors = {},
         attackPrimaryIndex = 0,
         pendingAttack = nil,
+        -- The current client advertises COMBAT_REMOTE_THREAD. Farm now follows
+        -- the same known SendHitsToServer path already used by Raid instead of
+        -- relying solely on the legacy direct RegisterHit call.
+        sendHits = nil,
+        sendHitsResolved = false,
+        sendHitsRetryAt = -math.huge,
+        combatThreadAvailable = nil,
+        -- If the server rejects a local NPC model repeatedly, narrow the next
+        -- attempt to one model and temporarily skip it only after that exact
+        -- model fails alone. This prevents a non-combat clone in a same-name
+        -- pack from permanently poisoning the whole Farm cluster.
+        singleTargetMode = false,
+        rejectedTargets = {},
         adaptiveAttackCooldown = 0.25,
         consecutiveRejected = 0,
         attackAccepted = 0,
@@ -3140,6 +3172,24 @@ end)(Flow)
         if left == right then return true end
         local normalizedLeft, normalizedRight = normalizedName(left), normalizedName(right)
         return normalizedLeft ~= "" and normalizedLeft == normalizedRight
+    end
+
+    function Farm:IsTemporarilyRejectedTarget(model)
+        local blocked = self.State.rejectedTargets and self.State.rejectedTargets[model]
+        if not blocked then return false end
+        if os.clock() >= (blocked.untilAt or 0) then
+            self.State.rejectedTargets[model] = nil
+            return false
+        end
+        return true
+    end
+
+    function Farm:MarkRejectedTarget(model)
+        if not model then return end
+        self.State.rejectedTargets = self.State.rejectedTargets or {}
+        -- A short cooldown lets the game refresh/despawn a visual clone while
+        -- Farm safely selects another verified same-name model.
+        self.State.rejectedTargets[model] = { untilAt = os.clock() + 12 }
     end
 
     function Farm:GetCharacter()
@@ -3708,7 +3758,7 @@ end)(Flow)
         if not enemies or not mobName then return results end
         for _, enemy in ipairs(enemies:GetChildren()) do
             local enemyRoot = modelRoot(enemy)
-            if sameMobName(enemy.Name, mobName) and alive(enemy) and enemyRoot then
+            if sameMobName(enemy.Name, mobName) and alive(enemy) and enemyRoot and not self:IsTemporarilyRejectedTarget(enemy) then
                 table.insert(results, { model = enemy, root = enemyRoot, humanoid = enemy:FindFirstChildOfClass("Humanoid") })
                 self:RememberObservedAnchor(mobName, enemyRoot.Position)
             end
@@ -3884,33 +3934,16 @@ end)(Flow)
     -- NPC again in the combat loop and the player anchor never follows staged
     -- NPC Roots, so a server correction cannot drag the player away.
     function Farm:BringMobs(target, center)
-        local wave = self.State.wave
-        if not State.farmBringMobs or not wave or wave.staged or not alive(target) then return end
-        local enemies = self:GetEnemies()
-        if not enemies or typeof(center) ~= "Vector3" then return end
-        local radius = clamp(tonumber(State.farmBringRadius) or 450, 60, 600)
-        local candidates = {}
-        for _, enemy in ipairs(enemies:GetChildren()) do
-            local root = modelRoot(enemy)
-            if sameMobName(enemy.Name, wave.mob) and alive(enemy) and root and (root.Position - center).Magnitude <= radius then table.insert(candidates, {enemy = enemy, root = root}) end
-        end
-        for index, entry in ipairs(candidates) do
-            local enemy, root = entry.enemy, entry.root
-            if not self.State.grouped[enemy] then
-                local humanoid = enemy:FindFirstChildOfClass("Humanoid")
-                self.State.grouped[enemy] = { canCollide = root.CanCollide, walkSpeed = humanoid and humanoid.WalkSpeed or nil }
-                local angle = (index - 1) * math.pi * 2 / math.max(1, #candidates)
-                local stagedPosition = center + Vector3.new(math.cos(angle) * 9, 0, math.sin(angle) * 9)
-                pcall(function() root.CanCollide = false; root.CFrame = CFrame.new(stagedPosition) end)
-                if humanoid then pcall(function() humanoid.WalkSpeed = 0 end) end
-            end
-        end
-        wave.staged = true
+        -- Farm Level must not client-CFrame Workspace NPCs. On mobile/current
+        -- servers that creates local-only copies at the rally point while the
+        -- server keeps the real NPC elsewhere; combat then targets a visual
+        -- clone and every hit is rejected. Raid has its separately bounded
+        -- owned-wave handling. Level Farm remains stable_no_sim and follows
+        -- server-replicated NPC positions only.
+        self:RestoreGrouped()
+        return false, "disabled_stable_no_sim"
     end
 
-    -- Raid passes only enemies already bound to its own verified island cluster.
-    -- This intentionally does not rescan Workspace.Enemies, so the global Farm
-    -- "Bring Mobs" option cannot reach a different player's Raid wave.
     function Farm:IsSafeExternalStageSurface(position, ignored)
         if typeof(position) ~= "Vector3" then return false, "position_missing" end
         local params = RaycastParams.new()
@@ -4007,11 +4040,20 @@ end)(Flow)
         if accepted then
             self.State.attackAccepted = self.State.attackAccepted + 1
             self.State.consecutiveRejected = 0
+            self.State.singleTargetMode = false
             self.State.adaptiveAttackCooldown = math.max(0.25, (self.State.adaptiveAttackCooldown or 0.25) - 0.01)
         else
             self.State.attackRejected = self.State.attackRejected + 1
             self.State.consecutiveRejected = self.State.consecutiveRejected + 1
-            if self.State.consecutiveRejected >= 2 then self.State.adaptiveAttackCooldown = math.min(0.35, (self.State.adaptiveAttackCooldown or 0.25) + 0.02) end
+            -- A single-model failure is attributable. Quarantine that model
+            -- briefly instead of hovering and retrying the same untouchable
+            -- clone indefinitely. Group failures first switch to exact target
+            -- mode so a good neighboring NPC is never discarded blindly.
+            if pending.models and #pending.models == 1 then self:MarkRejectedTarget(pending.models[1]) end
+            if self.State.consecutiveRejected >= 2 then
+                self.State.singleTargetMode = true
+                self.State.adaptiveAttackCooldown = math.min(0.35, (self.State.adaptiveAttackCooldown or 0.25) + 0.02)
+            end
         end
         self.State.pendingAttack = nil
     end
@@ -4025,6 +4067,43 @@ end)(Flow)
         return nil, nil
     end
 
+    -- Prefer the current game's own combat sender when the feature flag says
+    -- that a threaded combat path is active. This is the same bounded known
+    -- surface used by Raid; no arbitrary Remote discovery or replay occurs.
+    function Farm:GetSendHitsToServer()
+        local state, now = self.State, os.clock()
+        if type(state.sendHits) == "function" then return state.sendHits end
+        if now < (state.sendHitsRetryAt or -math.huge) then return nil end
+        state.sendHitsRetryAt = now + 2
+        local getsenv = Flow:GetExecutorFunction("getsenv")
+        local scripts = player and player:FindFirstChild("PlayerScripts")
+        if type(getsenv) ~= "function" or not scripts then return nil end
+        local checked = 0
+        for _, script in ipairs(scripts:GetChildren()) do
+            checked = checked + 1
+            if checked > 100 then break end
+            if script:IsA("LocalScript") then
+                local ok, environment = pcall(getsenv, script)
+                local sender = ok and environment and environment._G and environment._G.SendHitsToServer or nil
+                if type(sender) == "function" then
+                    state.sendHits = sender
+                    state.sendHitsResolved = true
+                    return sender
+                end
+            end
+        end
+        state.sendHitsResolved = false
+        return nil
+    end
+
+    function Farm:HasCombatRemoteThread()
+        if self.State.combatThreadAvailable ~= nil then return self.State.combatThreadAvailable == true end
+        local flags = replicatedStorage and replicatedStorage:FindFirstChild("Modules") and replicatedStorage.Modules:FindFirstChild("Flags")
+        local ok, values = pcall(function() return flags and require(flags) end)
+        self.State.combatThreadAvailable = ok and type(values) == "table" and values.COMBAT_REMOTE_THREAD == true
+        return self.State.combatThreadAvailable == true
+    end
+
     function Farm:GetCombatHitData(target)
         local root = self:GetRoot()
         local enemies = self:GetEnemies()
@@ -4033,7 +4112,9 @@ end)(Flow)
         local preferredParts = { "RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand" }
         for _, enemy in ipairs(enemies:GetChildren()) do
             local enemyRoot = modelRoot(enemy)
-            if enemy.Name == target.Name and alive(enemy) and enemyRoot and (enemyRoot.Position - root.Position).Magnitude <= 80 then
+            local sameTarget = enemy == target
+            local eligible = self.State.singleTargetMode == true and sameTarget or enemy.Name == target.Name
+            if eligible and alive(enemy) and enemyRoot and (enemyRoot.Position - root.Position).Magnitude <= 80 and not self:IsTemporarilyRejectedTarget(enemy) then
                 local part = nil
                 for _, name in ipairs(preferredParts) do part = enemy:FindFirstChild(name); if part then break end end
                 part = part or enemy.PrimaryPart or enemyRoot
@@ -4061,12 +4142,27 @@ end)(Flow)
         if not attack or not hit then return false, "combat_remotes_unavailable" end
         local primaryPart, hitData, health = self:GetCombatHitData(target)
         if not primaryPart or #hitData == 0 then return false, "target_out_of_range" end
+        local root = self:GetRoot()
+        -- Tool:Activate is the game's normal local input path and, unlike a
+        -- keyboard simulation, works on touch-only Delta/Android clients. Its
+        -- own LocalScript may prepare move state before the known combat route.
+        pcall(function() tool:Activate() end)
+        -- Preserve the known combat transport after the normal tool activation.
+        local click = tool:FindFirstChild("LeftClickRemote")
+        if click and click:IsA("RemoteEvent") and root then
+            local delta = primaryPart.Position - root.Position
+            local direction = delta.Magnitude > 0 and delta.Unit or Vector3.zero
+            pcall(function() click:FireServer(direction, 1) end)
+        end
         self.State.lastAttackAt = now
+        local models = {}
+        for _, row in ipairs(hitData) do table.insert(models, row[1]) end
         local ok, errorMessage = pcall(function()
             attack:FireServer(0)
-            hit:FireServer(primaryPart, hitData)
+            local sender = self:HasCombatRemoteThread() and self:GetSendHitsToServer() or nil
+            if sender then sender(primaryPart, hitData) else hit:FireServer(primaryPart, hitData) end
         end)
-        if ok then self.State.pendingAttack = { at = now, health = health, targets = #hitData } end
+        if ok then self.State.pendingAttack = { at = now, health = health, targets = #hitData, models = models } end
         return ok, ok and "attacked" or tostring(errorMessage or "attack_failed")
     end
 
@@ -4229,6 +4325,98 @@ end)(Flow)
     Flow.Features.Farm = Farm
 end)(Flow)
 
+-- >>> MODULE: features/race_v4.lua
+;(function(Flow)
+    local RaceV4 = {}
+    local player = Flow.Player
+    local virtualInput = Flow.Services.VirtualInputManager
+
+    RaceV4.FullThreshold = 0.995
+    RaceV4.ActivationKeyCode = 0x59 -- Y, the standard V4 transformation binding.
+
+    local function playerGui()
+        return player and player:FindFirstChildOfClass("PlayerGui") or nil
+    end
+    local function awakeningTool()
+        local character = player and player.Character
+        local backpack = player and player:FindFirstChildOfClass("Backpack")
+        return (character and character:FindFirstChild("Awakening")) or (backpack and backpack:FindFirstChild("Awakening"))
+    end
+
+    function RaceV4:GetMeter()
+        local gui = playerGui()
+        local root = gui and gui:FindFirstChild("RaceEnergyUI")
+        local meter = root and root:FindFirstChild("RaceEnergy")
+        local fill = meter and meter:FindFirstChild("Fill")
+        if not (meter and fill and fill:IsA("GuiObject")) then return nil, nil, "meter_missing" end
+        return meter, fill, nil
+    end
+
+    function RaceV4:GetEnergy()
+        local meter, fill, reason = self:GetMeter()
+        if not meter then return 0, false, reason end
+        local scale = tonumber(fill.Size.X.Scale) or 0
+        return math.clamp(scale, 0, 1), meter.Visible == true and fill.Visible == true, nil
+    end
+
+    function RaceV4:IsUnlocked()
+        local gui = playerGui()
+        local stats = gui and gui:FindFirstChild("StatsRoot")
+        local frame = stats and stats:FindFirstChild("Frame")
+        local menu = frame and frame:FindFirstChild("Menu")
+        local content = menu and menu:FindFirstChild("Content")
+        local raceFrame = content and content:FindFirstChild("Race")
+        local race = raceFrame and raceFrame:FindFirstChild("Race")
+        local text = race and race:IsA("TextLabel") and string.lower(tostring(race.Text)) or ""
+        if text:find("v4", 1, true) then return true, "race_label" end
+        local meter = self:GetMeter()
+        return meter ~= nil and awakeningTool() ~= nil, meter and "meter_and_awakening" or "v4_unavailable"
+    end
+
+    function RaceV4:IsReady()
+        local unlocked, unlockReason = self:IsUnlocked()
+        if not unlocked then return false, unlockReason end
+        local energy, visible, meterReason = self:GetEnergy()
+        if not visible then return false, meterReason or "meter_hidden" end
+        if energy < self.FullThreshold then return false, "energy=" .. string.format("%.3f", energy) end
+        return true, "energy_full"
+    end
+
+    function RaceV4:Activate()
+        local ready, reason = self:IsReady()
+        if not ready then return false, reason end
+        local executor = Flow.Executor or {}
+        if type(executor.keypress) == "function" and type(executor.keyrelease) == "function" then
+            local ok, detail = pcall(function()
+                executor.keypress(self.ActivationKeyCode)
+                task.wait(0.05)
+                executor.keyrelease(self.ActivationKeyCode)
+            end)
+            if ok then return true, "keypress_y" end
+            return false, "keypress_failed:" .. tostring(detail)
+        end
+        if virtualInput then
+            local ok, detail = pcall(function()
+                virtualInput:SendKeyEvent(true, Enum.KeyCode.Y, false, game)
+                task.wait(0.05)
+                virtualInput:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+            end)
+            if ok then return true, "virtual_input_y" end
+            return false, "virtual_input_failed:" .. tostring(detail)
+        end
+        return false, "v4_input_unavailable"
+    end
+
+    function RaceV4:GetSnapshot()
+        local energy, visible = self:GetEnergy()
+        local unlocked, unlockReason = self:IsUnlocked()
+        local ready, readyReason = self:IsReady()
+        return { unlocked = unlocked == true, unlockReason = unlockReason, energy = energy, meterVisible = visible == true, ready = ready == true, readyReason = readyReason }
+    end
+
+    Flow.Features.RaceV4 = RaceV4
+end)(Flow)
+
 -- >>> MODULE: features/raid/raid_manager.lua
 ;(function(Flow)
     local Raid = {}
@@ -4274,6 +4462,13 @@ end)(Flow)
     -- radius, but only while a target-filtered ground probe proves support.
     Raid.FinalIslandId = 5
     Raid.FinalBossFollowRadius = Raid.IslandMobRadius
+    -- The final-boss V4 question is displayed only on the initial observed
+    -- spawn and the user may choose to wait up to this long after confirming.
+    Raid.V4ActivationWaitSeconds = 60
+    -- After the last enemy dies, the server removes IslandRaiding before its
+    -- native return teleport is visible locally. Stay in an air hold until a
+    -- large, server-originated relocation proves the return is complete.
+    Raid.NativeReturnRelocationDistance = 2200
     Raid.WaveAnchorShift = 55
     -- Exact Castle on the Sea position requested for the normal Raid-chip
     -- summon flow. Auto Raid reaches it only through the existing Teleport
@@ -4419,6 +4614,21 @@ end)(Flow)
         -- Such a resumed Raid has already had its native arrival, so an empty
         -- wave may safely center on the verified island immediately.
         resumedActiveRaid = false,
+        -- Final-island V4 confirmation lifecycle. One observed final boss
+        -- spawn gets one decision only; a confirmed activation may wait for
+        -- meter recovery, but never sends repeated key presses.
+        v4FinalBossSpawnObserved = false,
+        v4Prompted = false,
+        v4PromptPending = false,
+        v4ActivationDeadline = 0,
+        v4ActivationAttempted = false,
+        v4ActivationAttemptedAt = 0,
+        -- Native end-of-Raid return hold. This preserves raised hover above
+        -- hazardous ground (notably Flame lava) until the game moves Root out.
+        awaitingNativeReturn = false,
+        nativeReturnOrigin = nil,
+        nativeReturnHoldCenter = nil,
+        nativeReturnStartedAt = 0,
     }
 
     local fruitByAlias = {}
@@ -5043,6 +5253,75 @@ end)(Flow)
         if self.ClearCombatWave then self:ClearCombatWave("session_cleared") end
         if farm and farm.ClearExternalStage then pcall(function() farm:ClearExternalStage("raid") end) end
         if farm and farm.EndExternalHover then pcall(function() farm:EndExternalHover("raid") end) end
+    end
+
+    -- The game ends IslandRaiding before the native return teleport arrives on
+    -- this client. Do not clear the existing Raid hover on that edge: Flame
+    -- ground is lava and a one-frame release is enough to take damage.
+    function Raid:BeginNativeRaidReturnHold()
+        local state, root = self.State, currentRoot()
+        if not root then return false, "root_missing" end
+        state.awaitingNativeReturn = true
+        state.nativeReturnStartedAt = os.clock()
+        state.nativeReturnOrigin = root.Position
+        local center = state.safeCombatCenter
+        if typeof(center) ~= "Vector3" then
+            local island = state.activeIsland
+            center = island and island.position or nil
+        end
+        if typeof(center) ~= "Vector3" then center = root.Position - Vector3.new(0, self:GetRaidHoverHeight(), 0) end
+        state.nativeReturnHoldCenter = center
+        state.v4ActivationDeadline = 0
+        state.v4PromptPending = false
+        self:ClearCombatWave("raid_finished_waiting_native_return")
+        if farm and farm.ClearExternalStage then pcall(function() farm:ClearExternalStage("raid") end) end
+        self:Trace("native_return", "hold_started|origin=" .. tostring(state.nativeReturnOrigin) .. "|center=" .. tostring(center))
+        return true, "native_return_hold_started"
+    end
+
+    function Raid:IsNativeRaidReturnConfirmed()
+        local state, root = self.State, currentRoot()
+        if not root then return false, "root_missing" end
+        local origin = state.nativeReturnOrigin
+        if typeof(origin) == "Vector3" then
+            local moved = (root.Position - origin).Magnitude
+            if moved >= self.NativeReturnRelocationDistance then
+                return true, "native_return_relocated|distance=" .. tostring(math.floor(moved + 0.5))
+            end
+            return false, "waiting_native_return|distance=" .. tostring(math.floor(moved + 0.5))
+        end
+        return false, "waiting_native_return_origin_missing"
+    end
+
+    function Raid:HoldForNativeRaidReturn()
+        local state, root = self.State, currentRoot()
+        local center = state.nativeReturnHoldCenter
+        if not root or typeof(center) ~= "Vector3" then return false, "return_hold_anchor_missing" end
+        if farm and farm.BeginExternalHover then
+            local ok, held, detail = pcall(function()
+                return farm:BeginExternalHover("raid", center, function()
+                    -- Farm evaluates this immediately before each Heartbeat
+                    -- CFrame write. If the game has just placed Root back in
+                    -- the normal world, release first so hover can never
+                    -- overwrite that native return teleport.
+                    if self.State.running ~= true or self.State.awaitingNativeReturn ~= true then return false end
+                    local returned = self:IsNativeRaidReturnConfirmed()
+                    return returned ~= true
+                end, self:GetRaidHoverHeight())
+            end)
+            if not ok or held ~= true then return false, detail or "native_return_hover_unavailable" end
+            return true, "native_return_raised_hover"
+        end
+        -- Never fall back to a local travel while waiting for the game's return.
+        return false, "native_return_hover_unavailable"
+    end
+
+    function Raid:ClearNativeRaidReturnHold()
+        local state = self.State
+        state.awaitingNativeReturn = false
+        state.nativeReturnOrigin = nil
+        state.nativeReturnHoldCenter = nil
+        state.nativeReturnStartedAt = 0
     end
 
     function Raid:AddOwnedIsland(island)
@@ -5830,7 +6109,83 @@ end)(Flow)
         task.spawn(function() self:RunCombat(generation, combatGeneration) end)
     end
 
+    function Raid:OfferFinalBossV4(island, mobs)
+        local state = self.State
+        if not island or island.id ~= self.FinalIslandId or #(mobs or {}) == 0 or state.v4FinalBossSpawnObserved then return end
+        -- This becomes true even when V4 is unavailable/not full: the popup is
+        -- specifically about this boss spawn and must not appear later in it.
+        state.v4FinalBossSpawnObserved = true
+        local raceV4 = Flow.Features and Flow.Features.RaceV4
+        local ready, readiness = false, "v4_feature_unavailable"
+        if raceV4 and raceV4.IsReady then ready, readiness = raceV4:IsReady() end
+        if not ready then
+            self:Trace("v4_prompt", "not_shown|" .. tostring(readiness))
+            return
+        end
+        local notifications = Flow.Features and Flow.Features.Notifications
+        if not notifications or not notifications.Confirm then
+            self:Trace("v4_prompt", "not_shown|notifications_unavailable")
+            return
+        end
+        state.v4Prompted = true
+        state.v4PromptPending = true
+        local id = notifications:Confirm("Chefe da Raid apareceu", "Sua V4 está pronta. Deseja ativá-la agora?", function(confirmed)
+            state.v4PromptPending = false
+            if confirmed ~= true then
+                self:Trace("v4_prompt", "declined_or_expired")
+                return
+            end
+            -- Confirmation grants exactly one delayed activation window. If
+            -- something spends the meter before the key is sent, this waits
+            -- calmly for recovery instead of clicking or prompting again.
+            if not state.running or not self:IsRaiding() then
+                self:Trace("v4_prompt", "confirmed_after_raid_end")
+                return
+            end
+            state.v4ActivationDeadline = os.clock() + self.V4ActivationWaitSeconds
+            state.v4ActivationAttempted = false
+            state.v4ActivationAttemptedAt = 0
+            self:Trace("v4_prompt", "confirmed|wait_seconds=" .. tostring(self.V4ActivationWaitSeconds))
+        end, { timeout = 6, confirmText = "Sim", cancelText = "Não" })
+        self:Trace("v4_prompt", "shown|notification=" .. tostring(id) .. "|timeout=6")
+    end
+
+    function Raid:ProcessConfirmedV4Activation()
+        local state = self.State
+        local deadline = tonumber(state.v4ActivationDeadline) or 0
+        if deadline <= 0 or state.v4ActivationAttempted == true then return end
+        if not self:IsRaiding() then
+            state.v4ActivationDeadline = 0
+            self:Trace("v4_activation", "cancelled_raid_ended")
+            return
+        end
+        if state.activeIslandId ~= self.FinalIslandId or state.combatActive ~= true then
+            state.v4ActivationDeadline = 0
+            self:Trace("v4_activation", "cancelled_final_boss_gone")
+            return
+        end
+        if os.clock() > deadline then
+            state.v4ActivationDeadline = 0
+            self:Trace("v4_activation", "expired_waiting_for_energy")
+            return
+        end
+        local raceV4 = Flow.Features and Flow.Features.RaceV4
+        local ready, readiness = false, "v4_feature_unavailable"
+        if raceV4 and raceV4.IsReady then ready, readiness = raceV4:IsReady() end
+        if not ready then
+            -- No action here: the confirmed one-minute window deliberately
+            -- waits for the observed meter to become full again.
+            return
+        end
+        local activated, detail = raceV4:Activate()
+        state.v4ActivationAttempted = true
+        state.v4ActivationAttemptedAt = os.clock()
+        state.v4ActivationDeadline = 0
+        self:Trace("v4_activation", (activated and "input_sent" or "input_failed") .. "|" .. tostring(detail or readiness))
+    end
+
     function Raid:StepActive()
+        self:ProcessConfirmedV4Activation()
         if self.LandingTestOnly == true then
             local held, reason = self:HoldNativeRaidArrivalAboveCurrent("landing_test_only")
             if not held then self:SetPhase("movement_failed", tostring(reason)); return end
@@ -5871,6 +6226,7 @@ end)(Flow)
         if mobIsland then chosen = mobIsland end
         self.State.activeIsland, self.State.activeIslandId = chosen, chosen.id
         if #mobs > 0 then
+            self:OfferFinalBossV4(chosen, mobs)
             self.State.waveSeen = true
             self.State.activeWaveSeen = true
             self.State.waitingAtNextIsland = false
@@ -6007,6 +6363,7 @@ end)(Flow)
         end
         if self:IsRaiding() then
             if not state.wasRaiding then
+                if state.awaitingNativeReturn then self:ClearNativeRaidReturnHold() end
                 state.raidStartedAt = os.clock()
                 state.emptySince = nil
                 state.activeIsland = nil
@@ -6015,6 +6372,12 @@ end)(Flow)
                 state.activeWaveSeen = false
                 state.waitingAtNextIsland = false
                 state.arrivalHoldCenter = nil
+                state.v4FinalBossSpawnObserved = false
+                state.v4Prompted = false
+                state.v4PromptPending = false
+                state.v4ActivationDeadline = 0
+                state.v4ActivationAttempted = false
+                state.v4ActivationAttemptedAt = 0
                 state.awaitingStartUntil = 0
                 state.startAttempts = 0
             end
@@ -6024,6 +6387,24 @@ end)(Flow)
         end
         if state.wasRaiding then
             state.wasRaiding = false
+            local held, holdReason = self:BeginNativeRaidReturnHold()
+            if not held then
+                self:SetPhase("native_return_hold_failed", tostring(holdReason))
+                return true
+            end
+            self:SetPhase("awaiting_native_raid_return", "keeping_safe_until_game_returns")
+            return true
+        end
+        if state.awaitingNativeReturn == true then
+            local returned, returnReason = self:IsNativeRaidReturnConfirmed()
+            if not returned then
+                local held, holdReason = self:HoldForNativeRaidReturn()
+                if not held then self:SetPhase("native_return_hold_failed", tostring(holdReason))
+                else self:SetPhase("awaiting_native_raid_return", tostring(returnReason)) end
+                return true
+            end
+            self:Trace("native_return", tostring(returnReason))
+            self:ClearNativeRaidReturnHold()
             state.completedCount = state.completedCount + 1
             local repeatGoalReached = self:RecordRepeatCompletion()
             state.activeIsland, state.activeIslandId, state.target = nil, nil, nil
@@ -6039,6 +6420,8 @@ end)(Flow)
             state.nativeTransferConfirmed = false
             state.nativeTransferOrigin = nil
             state.startAttempts = 0
+            state.v4ActivationDeadline = 0
+            state.v4PromptPending = false
             self:ClearOwnedRaidSession()
             state.startedByController = false
             state.resumedActiveRaid = false
@@ -6048,6 +6431,7 @@ end)(Flow)
                 -- user turning Auto Raid off, while preserving saved progress.
                 self:SetEnabled(false)
                 self:SetPhase("goal_complete", "repeat_goal_reached")
+                Flow:Notify({ kind = "success", title = "Auto Raid", message = "Meta de Raids concluída." })
                 return true
             end
             self:SetPhase("raid_finished", "awaiting_next_chip")
@@ -6183,6 +6567,9 @@ end)(Flow)
             self.State.nativeTransferStartedAt = 0
             self.State.nativeTransferConfirmed = false
             self.State.nativeTransferOrigin = nil
+            self.State.v4ActivationDeadline = 0
+            self.State.v4PromptPending = false
+            self:ClearNativeRaidReturnHold()
             self:ClearOwnedRaidSession()
             self.State.startedByController = false
             self.State.resumedActiveRaid = false
@@ -6207,6 +6594,13 @@ end)(Flow)
         end
         if teleport and teleport.ActiveTravel and teleport.CancelTravel then pcall(function() teleport:CancelTravel(nil, "raid_takeover") end) end
         self.State.running = true
+        self:ClearNativeRaidReturnHold()
+        self.State.v4FinalBossSpawnObserved = false
+        self.State.v4Prompted = false
+        self.State.v4PromptPending = false
+        self.State.v4ActivationDeadline = 0
+        self.State.v4ActivationAttempted = false
+        self.State.v4ActivationAttemptedAt = 0
         self.State.lastError = ""
         self.State.lastStartAt = -math.huge
         self.State.awaitingStartUntil = 0
@@ -6274,6 +6668,8 @@ end)(Flow)
         local islands = self:GetOwnedRaidIslands()
         local island = self.State.activeIsland
         local mobs = island and self.State.ownedIslands[island.object] and self:GetRaidMobs(island) or {}
+        local raceV4 = Flow.Features and Flow.Features.RaceV4
+        local v4 = raceV4 and raceV4.GetSnapshot and raceV4:GetSnapshot() or nil
         return {
             running = self.State.running == true,
             phase = self.State.phase or "idle",
@@ -6308,7 +6704,12 @@ end)(Flow)
             fastHitEvents = self.State.fastHitEvents or 0,
             combatPath = self.State.sendHitsResolved and "send_hits_to_server" or "register_hit",
             combatAnchor = self.State.combatAnchor and tostring(self.State.combatAnchor) or "",
-            lastError = self.State.lastError or "",
+            v4 = v4,
+            v4Prompted = self.State.v4Prompted == true,
+            v4PromptPending = self.State.v4PromptPending == true,
+            v4ActivationWaiting = (self.State.v4ActivationDeadline or 0) > os.clock(),
+            awaitingNativeReturn = self.State.awaitingNativeReturn == true,
+            lastError = self.State.lastError or "", 
         }
     end
 
@@ -10419,6 +10820,266 @@ Ij26vBYKbY2HRvz/QrMczCQXb8UAAAAASUVORK5CYII=
     }
 end)(Flow)
 
+-- >>> MODULE: features/system_notifications.lua
+;(function(Flow)
+    local Notifications = {}
+    local State = Flow.State
+    local Theme = Flow.Theme
+    local tweenService = Flow.Services.TweenService
+
+    Notifications.MaxVisible = 3
+    Notifications.DefaultDuration = 4.5
+    Notifications.DefaultQuestionTimeout = 30
+    Notifications.State = {
+        queue = {},
+        active = 0,
+        sequence = 0,
+        gui = nil,
+        holder = nil,
+        cards = {},
+    }
+
+    local positions = {
+        bottom_right = { anchor = Vector2.new(1, 1), position = UDim2.new(1, -16, 1, -16), vertical = Enum.VerticalAlignment.Bottom, horizontal = Enum.HorizontalAlignment.Right },
+        bottom_left = { anchor = Vector2.new(0, 1), position = UDim2.new(0, 16, 1, -16), vertical = Enum.VerticalAlignment.Bottom, horizontal = Enum.HorizontalAlignment.Left },
+        top_right = { anchor = Vector2.new(1, 0), position = UDim2.new(1, -16, 0, 16), vertical = Enum.VerticalAlignment.Top, horizontal = Enum.HorizontalAlignment.Right },
+        top_left = { anchor = Vector2.new(0, 0), position = UDim2.new(0, 16, 0, 16), vertical = Enum.VerticalAlignment.Top, horizontal = Enum.HorizontalAlignment.Left },
+    }
+
+    local styles = {
+        modern = { height = 78, background = function() return Theme.panel2 end, transparency = 0, stroke = function() return Theme.border end },
+        glass = { height = 78, background = function() return Theme.panel end, transparency = 0.12, stroke = function() return Theme.accent end },
+        compact = { height = 62, background = function() return Theme.panel3 end, transparency = 0, stroke = function() return Theme.border end },
+    }
+
+    local accents = {
+        info = function() return Theme.accent2 end,
+        success = function() return Theme.success end,
+        warning = function() return Color3.fromRGB(235, 177, 67) end,
+        error = function() return Theme.danger end,
+        question = function() return Color3.fromRGB(106, 163, 255) end,
+        input = function() return Theme.accent2 end,
+    }
+
+    local function validPosition(value) return positions[value] ~= nil end
+    local function validStyle(value) return styles[value] ~= nil end
+    local function configurationSave()
+        if Flow.Config and Flow.Config.Save then pcall(function() Flow.Config:Save() end) end
+    end
+    local function assets()
+        return Flow.Assets and Flow.Assets.Icons or {}
+    end
+    local function defaultIcon(kind)
+        local icon = assets()
+        if kind == "success" then return icon.check or icon.accent end
+        if kind == "error" then return icon.close or icon.skull end
+        if kind == "warning" then return icon.fog or icon.status end
+        if kind == "question" or kind == "input" then return icon.settings or icon.inventory end
+        return icon.status or icon.accent
+    end
+
+    function Notifications:GetPosition() return validPosition(State.notificationPosition) and State.notificationPosition or "bottom_right" end
+    function Notifications:GetStyle() return validStyle(State.notificationStyle) and State.notificationStyle or "modern" end
+
+    function Notifications:ApplyPresentation()
+        local holder = self.State.holder
+        if not holder then return end
+        local location = positions[self:GetPosition()]
+        holder.AnchorPoint = location.anchor
+        holder.Position = location.position
+        local layout = holder:FindFirstChildOfClass("UIListLayout")
+        if layout then
+            layout.VerticalAlignment = location.vertical
+            layout.HorizontalAlignment = location.horizontal
+        end
+    end
+
+    function Notifications:SetPosition(position)
+        if not validPosition(position) then return false, "notification_position_invalid" end
+        State.notificationPosition = position
+        self:ApplyPresentation()
+        configurationSave()
+        return true
+    end
+
+    function Notifications:SetStyle(style)
+        if not validStyle(style) then return false, "notification_style_invalid" end
+        State.notificationStyle = style
+        configurationSave()
+        return true
+    end
+
+    function Notifications:GetSnapshot()
+        return {
+            position = self:GetPosition(), style = self:GetStyle(),
+            queued = #self.State.queue, visible = self.State.active,
+        }
+    end
+
+    function Notifications:Attach(gui)
+        if not gui then return false, "gui_missing" end
+        local state = self.State
+        if state.holder and state.holder.Parent == gui then
+            state.gui = gui
+            self:ApplyPresentation()
+            self:Pump()
+            return true
+        end
+        if state.holder then pcall(function() state.holder:Destroy() end) end
+        state.gui = gui
+        state.holder = Theme.New("Frame", {
+            Name = "FlowKanHubNotifications",
+            Size = UDim2.new(0, 360, 0, 430),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ZIndex = 900,
+            Parent = gui,
+        })
+        local layout = Instance.new("UIListLayout")
+        layout.Padding = UDim.new(0, 7)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = state.holder
+        self:ApplyPresentation()
+        self:Pump()
+        return true
+    end
+
+    function Notifications:Dismiss(id, response, input)
+        local card = self.State.cards[id]
+        if not card or card.closing then return false end
+        card.closing = true
+        self.State.cards[id] = nil
+        local function finalize()
+            if card.frame and card.frame.Parent then card.frame:Destroy() end
+            self.State.active = math.max(0, self.State.active - 1)
+            if card.options and type(card.options.onResult) == "function" then
+                pcall(card.options.onResult, response, input)
+            end
+            self:Pump()
+        end
+        if card.frame and tweenService then
+            local ok, tween = pcall(function()
+                return tweenService:Create(card.frame, TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+                    BackgroundTransparency = 1, Position = UDim2.new(card.frame.Position.X.Scale, card.frame.Position.X.Offset + 18, card.frame.Position.Y.Scale, card.frame.Position.Y.Offset),
+                })
+            end)
+            if ok and tween then tween:Play(); task.delay(0.18, finalize); return true end
+        end
+        finalize()
+        return true
+    end
+
+    function Notifications:BuildCard(options)
+        local state = self.State
+        local style = styles[self:GetStyle()]
+        local kind = accents[options.kind] and options.kind or "info"
+        local interactive = options.mode == "confirm" or options.mode == "input"
+        local cardHeight = interactive and (options.mode == "input" and 162 or 126) or style.height
+        local frame = Theme.New("Frame", {
+            Name = "Notification_" .. tostring(options.id),
+            Size = UDim2.new(1, 0, 0, cardHeight),
+            BackgroundColor3 = style.background(),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ZIndex = 901,
+            LayoutOrder = options.id,
+            Parent = state.holder,
+        })
+        Theme.Round(frame, 10)
+        local stroke = Theme.Stroke(frame, style.stroke(), 1, 0.15)
+        local accent = accents[kind]()
+        local rail = Theme.New("Frame", { Size = UDim2.new(0, 4, 1, -18), Position = UDim2.new(0, 0, 0, 9), BackgroundColor3 = accent, BorderSizePixel = 0, ZIndex = 902, Parent = frame })
+        Theme.Round(rail, 2)
+        local iconFrame = Theme.New("Frame", { Size = UDim2.new(0, 30, 0, 30), Position = UDim2.new(0, 14, 0, 13), BackgroundColor3 = accent, BorderSizePixel = 0, ZIndex = 902, Parent = frame })
+        Theme.Round(iconFrame, 9)
+        Theme.New("ImageLabel", { Size = UDim2.new(0, 16, 0, 16), Position = UDim2.new(0.5, -8, 0.5, -8), BackgroundTransparency = 1, Image = options.icon or defaultIcon(kind) or "", ImageColor3 = Theme.text, ScaleType = Enum.ScaleType.Fit, ZIndex = 903, Parent = iconFrame })
+        Theme.New("TextLabel", { Size = UDim2.new(1, -72, 0, 18), Position = UDim2.new(0, 54, 0, 12), BackgroundTransparency = 1, Text = tostring(options.title or "Flow Kan Hub"), TextColor3 = Theme.text, TextSize = 12, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 902, Parent = frame })
+        local message = Theme.New("TextLabel", { Size = UDim2.new(1, -72, 0, interactive and 42 or 30), Position = UDim2.new(0, 54, 0, 31), BackgroundTransparency = 1, Text = tostring(options.message or ""), TextColor3 = Theme.muted, TextSize = 10, Font = Enum.Font.Gotham, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 902, Parent = frame })
+        local closeButton = Theme.New("TextButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -28, 0, 8), BackgroundTransparency = 1, BorderSizePixel = 0, Text = "×", TextColor3 = Theme.muted, TextSize = 16, Font = Enum.Font.GothamBold, AutoButtonColor = false, ZIndex = 903, Parent = frame })
+        local input
+        if options.mode == "input" then
+            input = Theme.New("TextBox", { Size = UDim2.new(1, -28, 0, 28), Position = UDim2.new(0, 14, 0, 76), BackgroundColor3 = Theme.panel3, BorderSizePixel = 0, Text = tostring(options.default or ""), PlaceholderText = tostring(options.placeholder or ""), ClearTextOnFocus = false, TextColor3 = Theme.text, PlaceholderColor3 = Theme.muted, TextSize = 10, Font = Enum.Font.Gotham, ZIndex = 902, Parent = frame })
+            Theme.Round(input, 7); Theme.Stroke(input, Theme.border, 1, 0.2)
+        end
+        if interactive then
+            local bottom = options.mode == "input" and 120 or 82
+            local cancel = Theme.New("TextButton", { Size = UDim2.new(0.5, -18, 0, 28), Position = UDim2.new(0, 14, 0, bottom), BackgroundColor3 = Theme.panel3, BorderSizePixel = 0, Text = tostring(options.cancelText or "Cancelar"), TextColor3 = Theme.text, TextSize = 10, Font = Enum.Font.GothamBold, AutoButtonColor = false, ZIndex = 902, Parent = frame })
+            local confirm = Theme.New("TextButton", { Size = UDim2.new(0.5, -18, 0, 28), Position = UDim2.new(0.5, 4, 0, bottom), BackgroundColor3 = accent, BorderSizePixel = 0, Text = tostring(options.confirmText or "Confirmar"), TextColor3 = Theme.text, TextSize = 10, Font = Enum.Font.GothamBold, AutoButtonColor = false, ZIndex = 902, Parent = frame })
+            Theme.Round(cancel, 7); Theme.Round(confirm, 7)
+            cancel.MouseButton1Click:Connect(function() self:Dismiss(options.id, false, input and input.Text or nil) end)
+            confirm.MouseButton1Click:Connect(function() self:Dismiss(options.id, true, input and input.Text or nil) end)
+        end
+        closeButton.MouseButton1Click:Connect(function() self:Dismiss(options.id, false, input and input.Text or nil) end)
+        frame.BackgroundTransparency = style.transparency
+        local showTween
+        if tweenService then
+            local target = frame.BackgroundTransparency
+            frame.BackgroundTransparency = 1
+            local ok, tween = pcall(function() return tweenService:Create(frame, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { BackgroundTransparency = target }) end)
+            if ok then showTween = tween end
+        end
+        if showTween then showTween:Play() end
+        return { frame = frame, options = options, closing = false, stroke = stroke }
+    end
+
+    function Notifications:Pump()
+        local state = self.State
+        if not state.holder or not state.holder.Parent then return end
+        while state.active < self.MaxVisible and #state.queue > 0 do
+            local options = table.remove(state.queue, 1)
+            local card = self:BuildCard(options)
+            state.cards[options.id] = card
+            state.active = state.active + 1
+            local interactive = options.mode == "confirm" or options.mode == "input"
+            local delaySeconds = tonumber(interactive and options.timeout or options.duration) or (interactive and self.DefaultQuestionTimeout or self.DefaultDuration)
+            if delaySeconds > 0 then
+                task.delay(delaySeconds, function()
+                    self:Dismiss(options.id, false, nil)
+                end)
+            end
+        end
+    end
+
+    function Notifications:Push(options)
+        if type(options) == "string" then options = { message = options } end
+        options = type(options) == "table" and options or {}
+        self.State.sequence = self.State.sequence + 1
+        options.id = self.State.sequence
+        options.kind = accents[options.kind] and options.kind or "info"
+        table.insert(self.State.queue, options)
+        self:Pump()
+        return options.id
+    end
+
+    function Notifications:Info(title, message, options)
+        options = options or {}; options.kind = "info"; options.title = title; options.message = message; return self:Push(options)
+    end
+    function Notifications:Success(title, message, options)
+        options = options or {}; options.kind = "success"; options.title = title; options.message = message; return self:Push(options)
+    end
+    function Notifications:Warning(title, message, options)
+        options = options or {}; options.kind = "warning"; options.title = title; options.message = message; return self:Push(options)
+    end
+    function Notifications:Error(title, message, options)
+        options = options or {}; options.kind = "error"; options.title = title; options.message = message; return self:Push(options)
+    end
+    function Notifications:Confirm(title, message, callback, options)
+        options = options or {}; options.kind = "question"; options.mode = "confirm"; options.title = title; options.message = message; options.onResult = callback; return self:Push(options)
+    end
+    function Notifications:Input(title, message, callback, options)
+        options = options or {}; options.kind = "input"; options.mode = "input"; options.title = title; options.message = message; options.onResult = callback; return self:Push(options)
+    end
+
+    function Notifications:Shutdown()
+        local state = self.State
+        state.queue, state.cards, state.active = {}, {}, 0
+        if state.holder then pcall(function() state.holder:Destroy() end) end
+        state.holder, state.gui = nil, nil
+    end
+
+    Flow.Features.Notifications = Notifications
+end)(Flow)
+
 -- >>> MODULE: core/language.lua
 ;(function(Flow)
     local Language = {}
@@ -10445,7 +11106,7 @@ end)(Flow)
             portal_delay_desc = "wait after equip", direct_fallback = "Direct Fallback",
             direct_fallback_desc = "move directly if Portal fails", portal_tool = "Portal Tool",
             portal_tool_desc = "equip Portal now", equip = "EQUIP", travel_intelligence = "TRAVEL INTELLIGENCE", travel_intelligence_desc = "live route preview; does not start travel", travel_location = "Location: %s", travel_location_unknown = "Location: unavailable", travel_portal_ready = "Portal C: %s / 200 — Ready", travel_portal_locked = "Portal C: %s / 200 — Locked", travel_portal_unknown = "Portal C: mastery unavailable", travel_portal_missing = "Portal C: Portal Fruit not found", travel_portal_cooldown = "Portal C: cooldown %.1fs", travel_native = "Map portals: Tiki %s · Mansion %s · Hydra %s", travel_target_none = "Route preview: waiting for a ground fruit", travel_target = "To %s: %s — %s", travel_times = "Direct %s · Portal %s · Map %s", travel_time = "%.1fs", travel_unavailable = "—", travel_route_direct = "Direct", travel_route_portal = "Portal Fruit", travel_route_world_portal = "Map portal", travel_reason_direct = "shortest route", travel_reason_portal = "Portal saves time", travel_reason_world_portal = "map portal saves time", travel_reason_portal_disabled = "Portal option is off", travel_reason_portal_missing = "Portal Fruit not found", travel_reason_portal_mastery = "World Warp needs mastery 200", travel_reason_portal_cooldown = "Portal is cooling down", travel_reason_world_portals_disabled = "map portals are off", travel_reason_no_confirmed_world_portal = "no confirmed map portal", travel_reason_no_island = "no nearby warp island", travel_status_available = "ready", travel_status_locked = "locked", travel_status_unknown = "not confirmed", travel_status_temporarily_unavailable = "temporarily unavailable", layout_width = "Layout Width",
-            layout_width_desc = "480 - 1000 pixels", layout_height = "Layout Height",
+            layout_width_desc = "480 - 1000 pixels", notifications = "Notifications", notification_position = "Notification Position", notification_position_desc = "choose where new notifications appear", notification_style = "Notification Style", notification_style_desc = "choose the look of notification cards", notification_bottom_right = "BOTTOM RIGHT", notification_bottom_left = "BOTTOM LEFT", notification_top_right = "TOP RIGHT", notification_top_left = "TOP LEFT", notification_style_modern = "MODERN", notification_style_glass = "GLASS", notification_style_compact = "COMPACT", notification_updated = "Notification settings updated", layout_height = "Layout Height",
             layout_height_desc = "340 - 720 pixels", layout_scale = "Layout Scale",
             layout_scale_desc = "resize the full hub", reset_profile = "Reset Profile",
             reset_profile_desc = "restore default settings", reset = "RESET", close = "CLOSE",
@@ -10468,7 +11129,7 @@ end)(Flow)
             portal_delay_desc = "aguarda após equipar", direct_fallback = "Ir Direto se Falhar",
             direct_fallback_desc = "continua por teleporte direto se o Portal falhar", portal_tool = "Equipar Portal",
             portal_tool_desc = "coloca o Portal na sua mão agora", equip = "EQUIPAR", layout_width = "Largura do Layout",
-            layout_width_desc = "480 - 1000 pixels", layout_height = "Altura do Layout",
+            layout_width_desc = "480 - 1000 pixels", notifications = "Notificações", notification_position = "Posição das Notificações", notification_position_desc = "escolha onde as novas notificações aparecem", notification_style = "Estilo das Notificações", notification_style_desc = "escolha a aparência dos cartões de notificação", notification_bottom_right = "ABAIXO À DIREITA", notification_bottom_left = "ABAIXO À ESQUERDA", notification_top_right = "ACIMA À DIREITA", notification_top_left = "ACIMA À ESQUERDA", notification_style_modern = "MODERNO", notification_style_glass = "VIDRO", notification_style_compact = "COMPACTO", notification_updated = "Configuração de notificação atualizada", layout_height = "Altura do Layout",
             layout_height_desc = "340 - 720 pixels", layout_scale = "Escala do Layout",
             layout_scale_desc = "redimensiona todo o hub", reset_profile = "Resetar Perfil",
             reset_profile_desc = "restaura configurações padrão", reset = "RESETAR", close = "FECHAR",
@@ -10491,7 +11152,7 @@ end)(Flow)
             portal_delay_desc = "espera después de equipar", direct_fallback = "Ruta Directa",
             direct_fallback_desc = "va directo si Portal falla", portal_tool = "Herramienta Portal",
             portal_tool_desc = "equipa Portal ahora", equip = "EQUIPAR", layout_width = "Ancho del Layout",
-            layout_width_desc = "480 - 1000 píxeles", layout_height = "Alto del Layout",
+            layout_width_desc = "480 - 1000 píxeles", notifications = "Notificaciones", notification_position = "Posición de Notificaciones", notification_position_desc = "elige dónde aparecen las nuevas notificaciones", notification_style = "Estilo de Notificaciones", notification_style_desc = "elige la apariencia de las notificaciones", notification_bottom_right = "ABAJO A LA DERECHA", notification_bottom_left = "ABAJO A LA IZQUIERDA", notification_top_right = "ARRIBA A LA DERECHA", notification_top_left = "ARRIBA A LA IZQUIERDA", notification_style_modern = "MODERNO", notification_style_glass = "CRISTAL", notification_style_compact = "COMPACTO", notification_updated = "Configuración de notificación actualizada", layout_height = "Alto del Layout",
             layout_height_desc = "340 - 720 píxeles", layout_scale = "Escala del Layout",
             layout_scale_desc = "redimensiona todo el hub", reset_profile = "Restablecer Perfil",
             reset_profile_desc = "restaura ajustes predeterminados", reset = "RESTABLECER", close = "CERRAR",
@@ -10514,7 +11175,7 @@ end)(Flow)
             portal_delay_desc = "chờ sau khi trang bị", direct_fallback = "Di Chuyển Trực Tiếp",
             direct_fallback_desc = "đi thẳng khi Portal lỗi", portal_tool = "Công Cụ Portal",
             portal_tool_desc = "trang bị Portal ngay", equip = "TRANG BỊ", layout_width = "Rộng Layout",
-            layout_width_desc = "480 - 1000 pixel", layout_height = "Cao Layout",
+            layout_width_desc = "480 - 1000 pixel", notifications = "Thông Báo", notification_position = "Vị Trí Thông Báo", notification_position_desc = "chọn nơi thông báo mới xuất hiện", notification_style = "Kiểu Thông Báo", notification_style_desc = "chọn diện mạo của thẻ thông báo", notification_bottom_right = "DƯỚI PHẢI", notification_bottom_left = "DƯỚI TRÁI", notification_top_right = "TRÊN PHẢI", notification_top_left = "TRÊN TRÁI", notification_style_modern = "HIỆN ĐẠI", notification_style_glass = "KÍNH", notification_style_compact = "GỌN", notification_updated = "Đã cập nhật cài đặt thông báo", layout_height = "Cao Layout",
             layout_height_desc = "340 - 720 pixel", layout_scale = "Tỷ Lệ Layout",
             layout_scale_desc = "đổi kích thước toàn hub", reset_profile = "Đặt Lại Hồ Sơ",
             reset_profile_desc = "khôi phục cài đặt gốc", reset = "ĐẶT LẠI", close = "ĐÓNG",
@@ -11610,6 +12271,9 @@ refreshFarmUI()
             Parent = playerGui,
         })
         Flow.Runtime.gui = gui
+        if Flow.Features and Flow.Features.Notifications and Flow.Features.Notifications.Attach then
+            pcall(function() Flow.Features.Notifications:Attach(gui) end)
+        end
         local iconAsset = Flow.Assets and Flow.Assets.Icon or ""
         local lucide = Flow.Assets and Flow.Assets.Icons or {}
 
@@ -13195,6 +13859,39 @@ refreshFarmUI()
         scaleRow.MouseLeave:Connect(function()
             scaleRow.BackgroundColor3 = Theme.panel2
         end)
+
+        do
+            local Notification = Flow.Features and Flow.Features.Notifications
+            local function optionCard(title, description, choices, current, onSelect)
+                local row = frame(styleList, { Size = UDim2.new(1, 0, 0, 94), BackgroundColor3 = Theme.panel2 }, 8)
+                label(row, { Size = UDim2.new(1, -22, 0, 18), Position = UDim2.new(0, 11, 0, 8), Text = title, TextSize = 13, Font = Enum.Font.GothamBold })
+                label(row, { Size = UDim2.new(1, -22, 0, 15), Position = UDim2.new(0, 11, 0, 29), Text = description, TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd })
+                local controls = {}
+                local width = math.floor((math.max(1, #choices) == 4 and 74 or 100))
+                for index, choice in ipairs(choices) do
+                    local control = button(row, choice.label, choice.key == current() and Theme.accent or Theme.panel3, 6)
+                    control.Size = UDim2.new(0, width, 0, 26)
+                    control.Position = UDim2.new(0, 11 + ((index - 1) * (width + 5)), 1, -34)
+                    controls[choice.key] = control
+                    control.MouseButton1Click:Connect(function()
+                        if not Notification then return end
+                        local ok = onSelect(choice.key)
+                        if not ok then return end
+                        for key, buttonControl in pairs(controls) do buttonControl.BackgroundColor3 = key == choice.key and Theme.accent or Theme.panel3 end
+                        Notification:Info(t("notifications"), t("notification_updated"), { duration = 2.5 })
+                    end)
+                end
+            end
+            if Notification then
+                optionCard(t("notification_position"), t("notification_position_desc"), {
+                    { key = "bottom_right", label = t("notification_bottom_right") }, { key = "bottom_left", label = t("notification_bottom_left") },
+                    { key = "top_right", label = t("notification_top_right") }, { key = "top_left", label = t("notification_top_left") },
+                }, function() return Notification:GetPosition() end, function(value) return Notification:SetPosition(value) end)
+                optionCard(t("notification_style"), t("notification_style_desc"), {
+                    { key = "modern", label = t("notification_style_modern") }, { key = "glass", label = t("notification_style_glass") }, { key = "compact", label = t("notification_style_compact") },
+                }, function() return Notification:GetStyle() end, function(value) return Notification:SetStyle(value) end)
+            end
+        end
 
         local resetRow = frame(styleList, {
             Size = UDim2.new(1, 0, 0, 56),
