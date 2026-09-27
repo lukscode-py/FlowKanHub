@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.37"
+    Flow.Version = "1.14.40"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -159,6 +159,10 @@ end)(Flow)
         -- Existing profiles receive the verified fast route once; later manual
         -- values remain the player's own saved preference.
         travelSpeedRevision = 1,
+        -- Direct travel guards. Water protection is on by default; the
+        -- obstacle guard escalates height only after a real wall/reroute signal.
+        antiWaterEnabled = true,
+        antiImpassableEnabled = true,
         usePortal = true,
         -- Native map portals are enabled only after this profile has positive
         -- inventory evidence or a successful physical portal test.
@@ -219,9 +223,13 @@ end)(Flow)
         -- Auto Raid off never loses a user's selected repeat goal.
         raidGoal = 0,
         raidGoalProgress = 0,
+        -- Hub keeps one fixed design canvas. Size presets scale the entire
+        -- interface rather than squeezing its width/height independently.
         layoutWidth = 620,
         layoutHeight = 440,
-        layoutScale = 1,
+        layoutScale = 1, -- legacy numeric preference; migrated to layoutSize.
+        layoutSize = "normal",
+        layoutPositionRevision = 2,
         -- Central notification presentation. Default is lower-right.
         notificationPosition = "bottom_right",
         notificationStyle = "modern",
@@ -230,7 +238,8 @@ end)(Flow)
         isCollecting = false,
         guiOpen = true,
         ballPosition = {0.5, -28, 0.5, -28},
-        hubPosition = {0.5, -310, 0.5, -210},
+        -- Center coordinate; revision 2 migrates old top-left offsets once.
+        hubPosition = {0.5, 0, 0.5, 0},
     }
 
     local validRaidTypes = {
@@ -294,6 +303,8 @@ end)(Flow)
         end
         if (tonumber(data.travelSpeedRevision) or 0) < 1 then state.teleportSpeed = 350 end
         state.travelSpeedRevision = 1
+        if type(data.antiWaterEnabled) == "boolean" then state.antiWaterEnabled = data.antiWaterEnabled end
+        if type(data.antiImpassableEnabled) == "boolean" then state.antiImpassableEnabled = data.antiImpassableEnabled end
         if type(data.usePortal) == "boolean" then state.usePortal = data.usePortal end
         if type(data.useWorldPortals) == "boolean" then state.useWorldPortals = data.useWorldPortals end
         if type(data.worldPortalStatus) == "table" then state.worldPortalStatus = copy(data.worldPortalStatus) end
@@ -347,7 +358,17 @@ end)(Flow)
         if type(data.raidGoalProgress) == "number" then state.raidGoalProgress = math.max(0, math.min(100000, math.floor(data.raidGoalProgress))) end
         if type(data.layoutWidth) == "number" then state.layoutWidth = math.max(480, math.min(1000, data.layoutWidth)) end
         if type(data.layoutHeight) == "number" then state.layoutHeight = math.max(340, math.min(720, data.layoutHeight)) end
-        if type(data.layoutScale) == "number" then state.layoutScale = math.max(0.8, math.min(1.25, data.layoutScale)) end
+        if type(data.layoutScale) == "number" then state.layoutScale = math.max(0.75, math.min(1.20, data.layoutScale)) end
+        local layoutSizes = { small = true, normal = true, large = true }
+        if type(data.layoutSize) == "string" and layoutSizes[data.layoutSize] then
+            state.layoutSize = data.layoutSize
+        elseif state.layoutScale <= 0.90 then
+            state.layoutSize = "small"
+        elseif state.layoutScale >= 1.08 then
+            state.layoutSize = "large"
+        else
+            state.layoutSize = "normal"
+        end
         local notificationPositions = { bottom_right = true, bottom_left = true, top_right = true, top_left = true }
         local notificationStyles = { modern = true, glass = true, compact = true }
         if type(data.notificationPosition) == "string" and notificationPositions[data.notificationPosition] then state.notificationPosition = data.notificationPosition end
@@ -358,7 +379,17 @@ end)(Flow)
         if type(data.ballPosition) == "table" then state.ballPosition = copy(data.ballPosition) end
 
         local position = legacy and data.guiPosition or data.hubPosition
-        if type(position) == "table" then state.hubPosition = copy(position) end
+        if type(position) == "table" then
+            state.hubPosition = copy(position)
+            -- Older profiles stored Main's top-left point. UIScale pivots the
+            -- complete Hub cleanly around its center, so convert that saved
+            -- coordinate once without moving a user-visible layout abruptly.
+            if (tonumber(data.layoutPositionRevision) or 0) < 2 then
+                state.hubPosition[2] = (tonumber(state.hubPosition[2]) or 0) + (state.layoutWidth * state.layoutScale) / 2
+                state.hubPosition[4] = (tonumber(state.hubPosition[4]) or 0) + (state.layoutHeight * state.layoutScale) / 2
+            end
+        end
+        state.layoutPositionRevision = 2
         return true
     end
 
@@ -368,6 +399,8 @@ end)(Flow)
             profile = self.ProfileKey,
             teleportSpeed = state.teleportSpeed,
             travelSpeedRevision = state.travelSpeedRevision,
+            antiWaterEnabled = state.antiWaterEnabled,
+            antiImpassableEnabled = state.antiImpassableEnabled,
             usePortal = state.usePortal,
             useWorldPortals = state.useWorldPortals,
             worldPortalStatus = copy(state.worldPortalStatus),
@@ -406,6 +439,8 @@ end)(Flow)
             layoutWidth = state.layoutWidth,
             layoutHeight = state.layoutHeight,
             layoutScale = state.layoutScale,
+            layoutSize = state.layoutSize,
+            layoutPositionRevision = state.layoutPositionRevision,
             notificationPosition = state.notificationPosition,
             notificationStyle = state.notificationStyle,
             language = state.language,
@@ -772,14 +807,26 @@ end)(Flow)
 ;(function(Flow)
     local Teleport = {}
     local tweenService = Flow.Services.TweenService
+    local runService = Flow.Services.RunService
+    local workspace = Flow.Services.Workspace
 
     Teleport.MinSpeed = 20
     Teleport.MaxSpeed = 350
     Teleport.PortalSavingsMargin = 0.75
     Teleport.ArrivalOffset = 3
     Teleport.ArrivalTolerance = 8
-    Teleport.ArrivalConfirmSeconds = 0.35
+    -- Confirmation runs after the movement lock is released, long enough for
+    -- the server to reconcile a client-only CFrame before success is reported.
+    Teleport.ArrivalConfirmSeconds = 1.20
     Teleport.FastSafeSpeed = 350
+    -- A route does not climb merely because it is long. It rises only for
+    -- water safety, a loaded obstruction, or a confirmed failed direct pass.
+    Teleport.SafeRouteSpeed = 220
+    Teleport.InitialClearance = 90
+    Teleport.WaterClearance = 135
+    Teleport.ClearanceStep = 140
+    Teleport.MaximumClearance = 720
+    Teleport.MaximumClearanceAttempts = 5
     Teleport.Metrics = { attempts = 0, confirmed = 0, retries = 0, lastSeconds = 0, lastReason = "" }
     Teleport.ActiveTravel = nil
     Teleport.Sequence = 0
@@ -883,6 +930,47 @@ end)(Flow)
             return
         end
         table.insert(ticket.cleanup, callback)
+    end
+
+    -- Records only Hub-owned travel state. It never reads or hooks game
+    -- Remotes, and makes the wall/correction diagnosis exportable.
+    function Teleport:RecordTravel(ticket, kind, detail, data)
+        local telemetry = Flow.Features and Flow.Features.SystemTelemetry
+        if telemetry and telemetry.Record then
+            pcall(function()
+                telemetry:Record(kind, "owner=" .. tostring(ticket and ticket.owner or "manual") .. "|" .. tostring(detail or ""), data)
+            end)
+        end
+    end
+
+    -- PlatformStand disables character controls, not gravity. While an actual
+    -- tween is moving, keep the locally owned assembly velocity at zero on
+    -- Heartbeat so gravity cannot accumulate into a fall between tween frames.
+    -- This deliberately never anchors the Root or writes its CFrame itself.
+    function Teleport:StartMotionStabilizer(ticket)
+        if not ticket or ticket.motionConnection or not runService then return end
+        local connection
+        local ok = pcall(function()
+            connection = runService.Heartbeat:Connect(function()
+                if not self:IsActive(ticket) or not ticket.inMotion then return end
+                local root = self:GetRoot()
+                if root and root.Parent then
+                    pcall(function()
+                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+                    end)
+                end
+            end)
+        end)
+        if ok then ticket.motionConnection = connection end
+    end
+
+    function Teleport:StopMotionStabilizer(ticket)
+        if not ticket then return end
+        ticket.inMotion = false
+        local connection = ticket.motionConnection
+        ticket.motionConnection = nil
+        if connection then pcall(function() connection:Disconnect() end) end
     end
 
     -- Direct tween travel is client-side motion through a collidable world.
@@ -1000,6 +1088,7 @@ end)(Flow)
             pcall(function() ticket.tween:Cancel() end)
             ticket.tween = nil
         end
+        self:StopMotionStabilizer(ticket)
         self:RestoreCharacter(ticket)
 
         for index = #ticket.cleanup, 1, -1 do
@@ -1032,6 +1121,118 @@ end)(Flow)
         if not root or not position then return math.huge end
         speed = clamp(tonumber(speed) or self:GetSpeed(), self.MinSpeed, self.MaxSpeed)
         return math.max(0.1, (root.Position - position).Magnitude / speed)
+    end
+
+    -- Read-only line probe. A direct CFrame tween that intersects a loaded
+    -- island wall can be visible only to this client and later be corrected by
+    -- the server. Detect that route before moving; no geometry is changed.
+    function Teleport:ProbeDirectPath(origin, destination)
+        if not workspace or not origin or not destination then return nil end
+        local direction = destination - origin
+        if direction.Magnitude < 1 then return nil end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {self:GetCharacter()}
+        params.IgnoreWater = true
+        local ok, hit = pcall(function() return workspace:Raycast(origin, direction, params) end)
+        return ok and hit or nil
+    end
+
+    -- Looks below a few points on the planned line. This is read-only and is
+    -- deliberately used only when the player has enabled Anti Water. A normal
+    -- route no longer pays a tall climb simply because it crosses the sea.
+    function Teleport:ProbeWaterRisk(origin, destination)
+        if Flow.State.antiWaterEnabled ~= true or not workspace then return false, nil end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {self:GetCharacter()}
+        params.IgnoreWater = false
+        local probeY = math.max(origin.Y, destination.Y, 80) + 40
+        local depth = math.max(900, probeY + 400)
+        for _, alpha in ipairs({0.25, 0.50, 0.75}) do
+            local point = origin:Lerp(destination, alpha)
+            local start = Vector3.new(point.X, probeY, point.Z)
+            local ok, hit = pcall(function() return workspace:Raycast(start, Vector3.new(0, -depth, 0), params) end)
+            if not ok or not hit then
+                return true, "no_support"
+            end
+            local material = tostring(hit.Material)
+            local instanceName = hit.Instance and string.lower(tostring(hit.Instance.Name)) or ""
+            if material:find("Water", 1, true) or instanceName:find("water", 1, true) then
+                return true, "water"
+            end
+        end
+        return false, nil
+    end
+
+    local function addWaypoint(route, point)
+        local previous = route[#route]
+        if not previous or (point - previous).Magnitude > 4 then table.insert(route, point) end
+    end
+
+    function Teleport:BuildSafeRoute(position, ticket)
+        local root = self:GetRoot()
+        if not root or not position then return nil, "route_root_missing" end
+        local origin = root.Position
+        local destination = Vector3.new(position.X, position.Y + self.ArrivalOffset, position.Z)
+        local distance = (destination - origin).Magnitude
+        local hit = self:ProbeDirectPath(origin, destination)
+        local waterRisk, waterDetail = self:ProbeWaterRisk(origin, destination)
+        local obstacleGuard = Flow.State.antiImpassableEnabled == true
+        local blocked = obstacleGuard and hit ~= nil
+        local forced = ticket and ticket.forceClearance == true
+        local needsClearance = blocked or waterRisk or forced
+
+        if not needsClearance then
+            self:RecordTravel(ticket, "teleport_route_probe", "direct|distance=" .. tostring(math.floor(distance + 0.5)) .. "|blocker=" .. tostring(hit and hit.Instance and hit.Instance.Name or "none") .. "|water=off_or_clear")
+            return { position }, { mode = "direct", distance = distance, blocker = nil, water = false }
+        end
+
+        -- Start low and move forward while climbing. Height increases only on
+        -- a real correction/stuck retry; there is no unconditional Y=1250 leg.
+        local clearance = tonumber(ticket and ticket.clearance) or self.InitialClearance
+        if waterRisk then clearance = math.max(clearance, self.WaterClearance) end
+        clearance = math.min(self.MaximumClearance, clearance)
+        if ticket then ticket.clearance = clearance end
+        local cruiseY = math.max(origin.Y, destination.Y) + clearance
+        local horizontalDistance = (Vector3.new(destination.X, 0, destination.Z) - Vector3.new(origin.X, 0, origin.Z)).Magnitude
+        local rise = math.max(0, cruiseY - origin.Y)
+        local lead = math.max(0.12, math.min(0.35, (rise / math.max(horizontalDistance, 1)) * 2.25))
+        if waterRisk then lead = math.max(lead, 0.18) end
+        local forward = origin:Lerp(destination, lead)
+        local climbPoint = Vector3.new(forward.X, cruiseY - self.ArrivalOffset, forward.Z)
+        local crossing = Vector3.new(destination.X, cruiseY - self.ArrivalOffset, destination.Z)
+        local route = {}
+        addWaypoint(route, climbPoint)
+        addWaypoint(route, crossing)
+        addWaypoint(route, position)
+
+        local blocker = hit and hit.Instance
+        local blockerName = blocker and blocker.Name or "none"
+        local mode = forced and "adaptive_clearance" or (blocked and "anti_element" or "anti_water")
+        self:RecordTravel(ticket, "teleport_route_probe", "mode=" .. mode .. "|distance=" .. tostring(math.floor(distance + 0.5)) .. "|clearance=" .. tostring(math.floor(clearance + 0.5)) .. "|lead=" .. string.format("%.2f", lead) .. "|blocker=" .. tostring(blockerName) .. "|water=" .. tostring(waterDetail or "clear"), {
+            hit = blockerName,
+            hitDistance = hit and math.floor(hit.Distance * 10 + 0.5) / 10 or nil,
+            clearance = clearance,
+            water = waterDetail,
+            routePoints = #route,
+        })
+        return route, { mode = mode, distance = distance, blocker = blockerName, water = waterRisk, clearance = clearance }
+    end
+
+    function Teleport:MoveRoute(position, ticket, requestedSpeed)
+        local route, routeInfo = self:BuildSafeRoute(position, ticket)
+        if not route then return false, routeInfo or "route_unavailable" end
+        ticket.routeInfo = routeInfo
+        local speed = clamp(tonumber(requestedSpeed) or self:GetSpeed(), self.MinSpeed, self.MaxSpeed)
+        if routeInfo.mode ~= "direct" then speed = math.min(speed, self.SafeRouteSpeed) end
+        for index, waypoint in ipairs(route) do
+            if self:IsCancelled(ticket) then return false, ticket.cancelReason or "cancelled", routeInfo end
+            local moved, reason = self:To(waypoint, speed, ticket)
+            self:RecordTravel(ticket, "teleport_route_segment", "mode=" .. tostring(routeInfo.mode) .. "|part=" .. tostring(index) .. "/" .. tostring(#route) .. "|ok=" .. tostring(moved == true) .. "|reason=" .. tostring(reason or "ok"))
+            if not moved then return false, reason or "route_segment_failed", routeInfo end
+        end
+        return true, "route_complete", routeInfo
     end
 
     function Teleport:NearestIsland(position, portal)
@@ -1132,63 +1333,97 @@ end)(Flow)
         return plan
     end
 
-    -- Confirm arrival after the tween releases its temporary character state.
-    -- The live matrix verified 350 at 1,902 studs; this guard catches a rare
-    -- server correction and retries once at 300 instead of treating a visual
-    -- tween completion as a successful route.
+    -- Confirm only after RestoreCharacter has returned collision, controls and
+    -- normal physics. The old order checked while the local lock still held,
+    -- so a server correction could happen seconds later and look like a false
+    -- success. This observes the unforced position instead.
     function Teleport:ConfirmArrival(position, ticket)
         local root = self:GetRoot()
         if not root or not position then return false, "arrival_root_missing" end
         local deadline = os.clock() + self.ArrivalConfirmSeconds
         local last = root.Position
-        local stable = 0
+        local largestStep = 0
         repeat
             if ticket and self:IsCancelled(ticket) then return false, "cancelled" end
             task.wait(0.05)
             root = self:GetRoot()
             if not root then return false, "arrival_root_missing" end
             local delta = (root.Position - last).Magnitude
+            largestStep = math.max(largestStep, delta)
             last = root.Position
-            if delta <= 1 then stable = stable + 0.05 else stable = 0 end
         until os.clock() >= deadline
         local distance = (root.Position - position).Magnitude
-        if distance <= self.ArrivalTolerance then return true, "arrival_confirmed" end
-        return false, "arrival_unconfirmed:" .. string.format("%.1f", distance)
+        local confirmed = distance <= self.ArrivalTolerance
+        self:RecordTravel(ticket, "teleport_arrival_check", "ok=" .. tostring(confirmed) .. "|distance=" .. string.format("%.1f", distance) .. "|maxStep=" .. string.format("%.1f", largestStep), {
+            distance = math.floor(distance * 10 + 0.5) / 10,
+            maxStep = math.floor(largestStep * 10 + 0.5) / 10,
+        })
+        if confirmed then return true, "arrival_confirmed" end
+        return false, "arrival_server_corrected:" .. string.format("%.1f", distance)
     end
 
     function Teleport:MoveAndConfirm(position, ticket, requestedSpeed)
         local began = os.clock()
         self.Metrics.attempts = self.Metrics.attempts + 1
-        local moved, reason = self:To(position, requestedSpeed, ticket)
-        if moved then
-            local confirmed, arrivalReason = self:ConfirmArrival(position, ticket)
-            if confirmed then
-                self.Metrics.confirmed = self.Metrics.confirmed + 1
-                self.Metrics.lastSeconds = os.clock() - began
-                self.Metrics.lastReason = arrivalReason
-                return true, arrivalReason
-            end
-            reason = arrivalReason
-        end
-        local currentSpeed = clamp(tonumber(requestedSpeed) or self:GetSpeed(), self.MinSpeed, self.MaxSpeed)
-        if not self:IsCancelled(ticket) and currentSpeed > 300 then
-            self.Metrics.retries = self.Metrics.retries + 1
-            local retried, retryReason = self:To(position, 300, ticket)
-            if retried then
+        local speed = clamp(tonumber(requestedSpeed) or self:GetSpeed(), self.MinSpeed, self.MaxSpeed)
+        local lastReason = "movement_failed"
+
+        for attempt = 1, self.MaximumClearanceAttempts do
+            if self:IsCancelled(ticket) then break end
+            local moved, reason, routeInfo = self:MoveRoute(position, ticket, speed)
+            if moved then
+                -- Release the local movement state before deciding whether the
+                -- server actually accepted the endpoint.
+                self:StopMotionStabilizer(ticket)
+                self:RestoreCharacter(ticket)
                 local confirmed, arrivalReason = self:ConfirmArrival(position, ticket)
                 if confirmed then
                     self.Metrics.confirmed = self.Metrics.confirmed + 1
                     self.Metrics.lastSeconds = os.clock() - began
-                    self.Metrics.lastReason = "retry_300"
-                    return true, "retry_300"
+                    self.Metrics.lastReason = attempt > 1 and "clearance_retry_" .. tostring(attempt) or arrivalReason
+                    return true, self.Metrics.lastReason
                 end
-                retryReason = arrivalReason
+                reason = arrivalReason
+            else
+                -- A failed segment must not carry a local collision/physics
+                -- lock into the next adaptive attempt.
+                self:StopMotionStabilizer(ticket)
+                self:RestoreCharacter(ticket)
             end
-            reason = retryReason or reason
+            lastReason = reason or lastReason
+            if self:IsCancelled(ticket) then break end
+
+            -- A direct endpoint corrected by the server is evidence that the
+            -- line was not traversable. Do not jump to a fixed altitude: retry
+            -- from the corrected position, adding only one clearance step each
+            -- time until a route is accepted or the conservative cap is met.
+            local canEscalate = Flow.State.antiImpassableEnabled == true
+            local currentClearance = tonumber(ticket.clearance) or 0
+            if canEscalate and currentClearance < self.MaximumClearance then
+                local nextClearance = currentClearance > 0 and currentClearance + self.ClearanceStep or self.InitialClearance
+                nextClearance = math.min(self.MaximumClearance, nextClearance)
+                if nextClearance > currentClearance then
+                    self.Metrics.retries = self.Metrics.retries + 1
+                    ticket.forceClearance = true
+                    ticket.clearance = nextClearance
+                    speed = math.min(speed, self.SafeRouteSpeed)
+                    self:RecordTravel(ticket, "teleport_clearance_retry", "attempt=" .. tostring(attempt + 1) .. "|previous=" .. tostring(math.floor(currentClearance + 0.5)) .. "|next=" .. tostring(math.floor(nextClearance + 0.5)) .. "|cause=" .. tostring(lastReason))
+                else
+                    break
+                end
+            elseif speed > 300 and attempt == 1 then
+                -- Preserve the older, non-obstacle compatibility retry when
+                -- the obstacle guard is intentionally switched off.
+                self.Metrics.retries = self.Metrics.retries + 1
+                speed = 300
+            else
+                break
+            end
         end
+        self:StopMotionStabilizer(ticket)
         self.Metrics.lastSeconds = os.clock() - began
-        self.Metrics.lastReason = tostring(reason or "movement_failed")
-        return false, reason
+        self.Metrics.lastReason = tostring(lastReason)
+        return false, lastReason
     end
 
     -- Shared executor for every user-requested route: fruit collection and the
@@ -1344,10 +1579,16 @@ end)(Flow)
         local duration = math.max(0.1, distance / speed)
         self:FreezeCharacter(ticket, self:GetHumanoid(), not (options and options.lockRoot == false))
 
-        -- A single active tween, zeroed momentum and a temporary Root lock prevent stacked
-        -- tweens or collision resolution from lifting the character upward.
+        -- A tween updates CFrame, but PlatformStand alone still permits gravity
+        -- to accumulate. The bounded Heartbeat stabilizer keeps only velocity
+        -- at zero for this segment; it never anchors or fakes a final position.
         pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
         pcall(function() root.AssemblyAngularVelocity = Vector3.new(0, 0, 0) end)
+        local stabilizeMotion = not (options and options.lockRoot == false)
+        if stabilizeMotion then
+            ticket.inMotion = true
+            self:StartMotionStabilizer(ticket)
+        end
 
         local ok, errorMessage = pcall(function()
             local tween = tweenService:Create(
@@ -1360,6 +1601,7 @@ end)(Flow)
             tween.Completed:Wait()
             if ticket.tween == tween then ticket.tween = nil end
         end)
+        self:StopMotionStabilizer(ticket)
 
         local cancelled = self:IsCancelled(ticket)
         if ownsTicket then self:EndTravel(ticket) end
@@ -11101,14 +11343,14 @@ end)(Flow)
             specific_fruits = "Specific Fruits", specific_fruits_desc = "%d selected", all_active = "all active",
             select = "SELECT", scan_interval = "Scan Interval", scan_interval_desc = "0.5 - 10 seconds",
             found_fruits = "Found Fruits", no_fruits = "no fruits found", selected = "SELECTED", all = "ALL",
-            tp = "TP", get = "GET", travel_speed = "Teleport Speed", travel_speed_desc = "20 - 350 safe limit",
+            tp = "TP", get = "GET", travel_speed = "Teleport Speed", travel_speed_desc = "20 - 350 safe limit", anti_water = "Anti Water", anti_water_desc = "uses a low safe route when water is below the path", anti_impassable = "Anti Impassable Elements", anti_impassable_desc = "raises gradually only after a wall or correction is detected",
             use_portal = "Use Portal Fruit", use_portal_desc = "use Portal Fruit for travel", use_world_portals = "Use Portals", use_world_portals_desc = "use confirmed map portals when they save time", portal_delay = "Portal Fruit Delay",
             portal_delay_desc = "wait after equip", direct_fallback = "Direct Fallback",
             direct_fallback_desc = "move directly if Portal fails", portal_tool = "Portal Tool",
             portal_tool_desc = "equip Portal now", equip = "EQUIP", travel_intelligence = "TRAVEL INTELLIGENCE", travel_intelligence_desc = "live route preview; does not start travel", travel_location = "Location: %s", travel_location_unknown = "Location: unavailable", travel_portal_ready = "Portal C: %s / 200 — Ready", travel_portal_locked = "Portal C: %s / 200 — Locked", travel_portal_unknown = "Portal C: mastery unavailable", travel_portal_missing = "Portal C: Portal Fruit not found", travel_portal_cooldown = "Portal C: cooldown %.1fs", travel_native = "Map portals: Tiki %s · Mansion %s · Hydra %s", travel_target_none = "Route preview: waiting for a ground fruit", travel_target = "To %s: %s — %s", travel_times = "Direct %s · Portal %s · Map %s", travel_time = "%.1fs", travel_unavailable = "—", travel_route_direct = "Direct", travel_route_portal = "Portal Fruit", travel_route_world_portal = "Map portal", travel_reason_direct = "shortest route", travel_reason_portal = "Portal saves time", travel_reason_world_portal = "map portal saves time", travel_reason_portal_disabled = "Portal option is off", travel_reason_portal_missing = "Portal Fruit not found", travel_reason_portal_mastery = "World Warp needs mastery 200", travel_reason_portal_cooldown = "Portal is cooling down", travel_reason_world_portals_disabled = "map portals are off", travel_reason_no_confirmed_world_portal = "no confirmed map portal", travel_reason_no_island = "no nearby warp island", travel_status_available = "ready", travel_status_locked = "locked", travel_status_unknown = "not confirmed", travel_status_temporarily_unavailable = "temporarily unavailable", layout_width = "Layout Width",
             layout_width_desc = "480 - 1000 pixels", notifications = "Notifications", notification_position = "Notification Position", notification_position_desc = "choose where new notifications appear", notification_style = "Notification Style", notification_style_desc = "choose the look of notification cards", notification_bottom_right = "BOTTOM RIGHT", notification_bottom_left = "BOTTOM LEFT", notification_top_right = "TOP RIGHT", notification_top_left = "TOP LEFT", notification_style_modern = "MODERN", notification_style_glass = "GLASS", notification_style_compact = "COMPACT", notification_updated = "Notification settings updated", layout_height = "Layout Height",
             layout_height_desc = "340 - 720 pixels", layout_scale = "Layout Scale",
-            layout_scale_desc = "resize the full hub", reset_profile = "Reset Profile",
+            layout_scale_desc = "resize the full hub", hub_size = "Hub Size", hub_size_desc = "scales the entire Hub and always fits your screen", hub_size_small = "SMALL", hub_size_normal = "NORMAL", hub_size_large = "LARGE", reset_profile = "Reset Profile",
             reset_profile_desc = "restore default settings", reset = "RESET", close = "CLOSE",
             language_desc = "hub language", active = "ACTIVE", idle = "idle", saved = "saved",
             fail = "fail", ok = "ok", profile = "profile", auto = "auto", portal_on = "portal on",
@@ -11124,14 +11366,14 @@ end)(Flow)
             specific_fruits = "Frutas Específicas", specific_fruits_desc = "%d selecionadas", all_active = "todas ativas",
             select = "SELECIONAR", scan_interval = "Intervalo de Busca", scan_interval_desc = "0,5 - 10 segundos",
             found_fruits = "Frutas Encontradas", no_fruits = "nenhuma fruta encontrada", selected = "SELECIONADA", all = "TODAS",
-            tp = "TP", get = "PEGAR", travel_speed = "Velocidade de Teleporte", travel_speed_desc = "limite seguro: 20 - 350",
+            tp = "TP", get = "PEGAR", travel_speed = "Velocidade de Teleporte", travel_speed_desc = "limite seguro: 20 - 350", anti_water = "Anti Água", anti_water_desc = "usa uma rota baixa e segura quando há água sob o caminho", anti_impassable = "Anti Elementos Intransponíveis", anti_impassable_desc = "sobe gradualmente só após detectar parede ou correção",
             use_portal = "Usar Fruta Portal", use_portal_desc = "usa a Fruta Portal para se teleportar", use_world_portals = "Usar Portais", use_world_portals_desc = "usa portais do mapa confirmados quando poupam tempo", portal_delay = "Espera da Fruta Portal",
             portal_delay_desc = "aguarda após equipar", direct_fallback = "Ir Direto se Falhar",
             direct_fallback_desc = "continua por teleporte direto se o Portal falhar", portal_tool = "Equipar Portal",
             portal_tool_desc = "coloca o Portal na sua mão agora", equip = "EQUIPAR", layout_width = "Largura do Layout",
             layout_width_desc = "480 - 1000 pixels", notifications = "Notificações", notification_position = "Posição das Notificações", notification_position_desc = "escolha onde as novas notificações aparecem", notification_style = "Estilo das Notificações", notification_style_desc = "escolha a aparência dos cartões de notificação", notification_bottom_right = "ABAIXO À DIREITA", notification_bottom_left = "ABAIXO À ESQUERDA", notification_top_right = "ACIMA À DIREITA", notification_top_left = "ACIMA À ESQUERDA", notification_style_modern = "MODERNO", notification_style_glass = "VIDRO", notification_style_compact = "COMPACTO", notification_updated = "Configuração de notificação atualizada", layout_height = "Altura do Layout",
             layout_height_desc = "340 - 720 pixels", layout_scale = "Escala do Layout",
-            layout_scale_desc = "redimensiona todo o hub", reset_profile = "Resetar Perfil",
+            layout_scale_desc = "redimensiona todo o hub", hub_size = "Tamanho do Hub", hub_size_desc = "redimensiona toda a interface e sempre respeita a tela", hub_size_small = "PEQUENO", hub_size_normal = "NORMAL", hub_size_large = "GRANDE", reset_profile = "Resetar Perfil",
             reset_profile_desc = "restaura configurações padrão", reset = "RESETAR", close = "FECHAR",
             language_desc = "idioma do hub", active = "ATIVO", idle = "parado", saved = "salvo",
             fail = "falhou", ok = "ok", profile = "perfil", auto = "automático", portal_on = "portal ligado",
@@ -11147,14 +11389,14 @@ end)(Flow)
             specific_fruits = "Frutas Específicas", specific_fruits_desc = "%d seleccionadas", all_active = "todas activas",
             select = "SELECCIONAR", scan_interval = "Intervalo de Búsqueda", scan_interval_desc = "0,5 - 10 segundos",
             found_fruits = "Frutas Encontradas", no_fruits = "no se encontraron frutas", selected = "SELECCIONADA", all = "TODAS",
-            tp = "TP", get = "TOMAR", travel_speed = "Velocidad de Teletransporte", travel_speed_desc = "límite seguro: 20 - 350",
+            tp = "TP", get = "TOMAR", travel_speed = "Velocidad de Teletransporte", travel_speed_desc = "límite seguro: 20 - 350", anti_water = "Anti Agua", anti_water_desc = "usa una ruta baja y segura cuando hay agua bajo el trayecto", anti_impassable = "Anti Elementos Impasables", anti_impassable_desc = "sube gradualmente solo al detectar una pared o corrección",
             use_portal = "Usar Fruta Portal", use_portal_desc = "usa la Fruta Portal para viajar", use_world_portals = "Usar Portales", use_world_portals_desc = "usa portales del mapa confirmados cuando ahorran tiempo", portal_delay = "Espera de Fruta Portal",
             portal_delay_desc = "espera después de equipar", direct_fallback = "Ruta Directa",
             direct_fallback_desc = "va directo si Portal falla", portal_tool = "Herramienta Portal",
             portal_tool_desc = "equipa Portal ahora", equip = "EQUIPAR", layout_width = "Ancho del Layout",
             layout_width_desc = "480 - 1000 píxeles", notifications = "Notificaciones", notification_position = "Posición de Notificaciones", notification_position_desc = "elige dónde aparecen las nuevas notificaciones", notification_style = "Estilo de Notificaciones", notification_style_desc = "elige la apariencia de las notificaciones", notification_bottom_right = "ABAJO A LA DERECHA", notification_bottom_left = "ABAJO A LA IZQUIERDA", notification_top_right = "ARRIBA A LA DERECHA", notification_top_left = "ARRIBA A LA IZQUIERDA", notification_style_modern = "MODERNO", notification_style_glass = "CRISTAL", notification_style_compact = "COMPACTO", notification_updated = "Configuración de notificación actualizada", layout_height = "Alto del Layout",
             layout_height_desc = "340 - 720 píxeles", layout_scale = "Escala del Layout",
-            layout_scale_desc = "redimensiona todo el hub", reset_profile = "Restablecer Perfil",
+            layout_scale_desc = "redimensiona todo el hub", hub_size = "Tamaño del Hub", hub_size_desc = "escala toda la interfaz y siempre cabe en la pantalla", hub_size_small = "PEQUEÑO", hub_size_normal = "NORMAL", hub_size_large = "GRANDE", reset_profile = "Restablecer Perfil",
             reset_profile_desc = "restaura ajustes predeterminados", reset = "RESTABLECER", close = "CERRAR",
             language_desc = "idioma del hub", active = "ACTIVO", idle = "inactivo", saved = "guardado",
             fail = "falló", ok = "ok", profile = "perfil", auto = "automático", portal_on = "portal activo",
@@ -11170,14 +11412,14 @@ end)(Flow)
             specific_fruits = "Trái Cây Cụ Thể", specific_fruits_desc = "%d đã chọn", all_active = "đang chọn tất cả",
             select = "CHỌN", scan_interval = "Khoảng Quét", scan_interval_desc = "0,5 - 10 giây",
             found_fruits = "Trái Cây Đã Tìm Thấy", no_fruits = "không tìm thấy trái cây", selected = "ĐÃ CHỌN", all = "TẤT CẢ",
-            tp = "TP", get = "LẤY", travel_speed = "Tốc Độ Dịch Chuyển", travel_speed_desc = "giới hạn an toàn: 20 - 350",
+            tp = "TP", get = "LẤY", travel_speed = "Tốc Độ Dịch Chuyển", travel_speed_desc = "giới hạn an toàn: 20 - 350", anti_water = "Chống Nước", anti_water_desc = "dùng đường bay thấp an toàn khi có nước bên dưới", anti_impassable = "Chống Vật Cản", anti_impassable_desc = "chỉ nâng dần khi phát hiện tường hoặc bị chỉnh vị trí",
             use_portal = "Dùng Trái Portal", use_portal_desc = "dùng Trái Portal để dịch chuyển", use_world_portals = "Dùng Cổng Dịch Chuyển", use_world_portals_desc = "dùng cổng bản đồ đã xác nhận khi nhanh hơn", portal_delay = "Chờ Trái Portal",
             portal_delay_desc = "chờ sau khi trang bị", direct_fallback = "Di Chuyển Trực Tiếp",
             direct_fallback_desc = "đi thẳng khi Portal lỗi", portal_tool = "Công Cụ Portal",
             portal_tool_desc = "trang bị Portal ngay", equip = "TRANG BỊ", layout_width = "Rộng Layout",
             layout_width_desc = "480 - 1000 pixel", notifications = "Thông Báo", notification_position = "Vị Trí Thông Báo", notification_position_desc = "chọn nơi thông báo mới xuất hiện", notification_style = "Kiểu Thông Báo", notification_style_desc = "chọn diện mạo của thẻ thông báo", notification_bottom_right = "DƯỚI PHẢI", notification_bottom_left = "DƯỚI TRÁI", notification_top_right = "TRÊN PHẢI", notification_top_left = "TRÊN TRÁI", notification_style_modern = "HIỆN ĐẠI", notification_style_glass = "KÍNH", notification_style_compact = "GỌN", notification_updated = "Đã cập nhật cài đặt thông báo", layout_height = "Cao Layout",
             layout_height_desc = "340 - 720 pixel", layout_scale = "Tỷ Lệ Layout",
-            layout_scale_desc = "đổi kích thước toàn hub", reset_profile = "Đặt Lại Hồ Sơ",
+            layout_scale_desc = "đổi kích thước toàn hub", hub_size = "Kích Thước Hub", hub_size_desc = "đổi kích thước toàn Hub và luôn vừa màn hình", hub_size_small = "NHỎ", hub_size_normal = "THƯỜNG", hub_size_large = "LỚN", reset_profile = "Đặt Lại Hồ Sơ",
             reset_profile_desc = "khôi phục cài đặt gốc", reset = "ĐẶT LẠI", close = "ĐÓNG",
             language_desc = "ngôn ngữ hub", active = "ĐANG DÙNG", idle = "chờ", saved = "đã lưu",
             fail = "lỗi", ok = "ok", profile = "hồ sơ", auto = "tự động", portal_on = "portal bật",
@@ -12276,15 +12518,24 @@ refreshFarmUI()
         end
         local iconAsset = Flow.Assets and Flow.Assets.Icon or ""
         local lucide = Flow.Assets and Flow.Assets.Icons or {}
+        local tweenService = Flow.Services.TweenService
 
         local main = frame(gui, {
             Name = "Main",
-            Size = UDim2.new(0, State.layoutWidth * State.layoutScale, 0, State.layoutHeight * State.layoutScale),
+            -- The fixed design canvas is scaled as one unit by HubScale below.
+            -- Do not multiply this Size directly: that leaves fixed-pixel
+            -- children oversized on a smaller mobile frame.
+            Size = UDim2.new(0, State.layoutWidth, 0, State.layoutHeight),
+            AnchorPoint = Vector2.new(0.5, 0.5),
             Position = UDim2.new(State.hubPosition[1], State.hubPosition[2], State.hubPosition[3], State.hubPosition[4]),
             BackgroundColor3 = Theme.bg,
             Active = true,
         }, 12)
         Theme.Stroke(main, Theme.border, 1, 0)
+        local hubScale = Instance.new("UIScale")
+        hubScale.Name = "HubScale"
+        hubScale.Scale = 1
+        hubScale.Parent = main
 
         local header = frame(main, {
             Name = "Header",
@@ -13042,16 +13293,34 @@ refreshFarmUI()
             })
         end
 
-        local function updateLayout()
-            local scale = math.max(0.8, math.min(1.25, tonumber(State.layoutScale) or 1))
-            main.Size = UDim2.new(0, math.floor(State.layoutWidth * scale), 0, math.floor(State.layoutHeight * scale))
+        local layoutPresets = { small = 0.78, normal = 1.00, large = 1.12 }
+        local layoutTween
+        local function updateLayout(smooth)
+            local width = math.max(480, math.min(1000, tonumber(State.layoutWidth) or 620))
+            local height = math.max(340, math.min(720, tonumber(State.layoutHeight) or 440))
+            main.Size = UDim2.new(0, width, 0, height)
+            local requested = layoutPresets[State.layoutSize] or tonumber(State.layoutScale) or 1
+            local camera = Flow.Services.Workspace and Flow.Services.Workspace.CurrentCamera
+            local viewport = camera and camera.ViewportSize or Vector2.new(width, height)
+            -- Reserve five percent on every edge so a responsive Hub never
+            -- fills an Android display from edge to edge.
+            local fit = math.min((math.max(1, viewport.X * 0.90) / width), (math.max(1, viewport.Y * 0.90) / height))
+            -- Never exceed either the chosen preset or the safe visible area.
+            local scale = math.max(0.05, math.min(requested, fit))
+            if layoutTween then pcall(function() layoutTween:Cancel() end) end
+            if smooth and tweenService then
+                local ok, tween = pcall(function()
+                    return tweenService:Create(hubScale, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Scale = scale })
+                end)
+                if ok and tween then layoutTween = tween; tween:Play(); return end
+            end
+            hubScale.Scale = scale
         end
 
         local function updateNumber(box, key, minimum, maximum)
             local value = tonumber(box.Text)
             if value and value >= minimum and value <= maximum then
                 State[key] = value
-                if key == "layoutWidth" or key == "layoutHeight" then updateLayout() end
                 Config:Save()
                 setStatus(t("saved"), Theme.success)
             else
@@ -13059,6 +13328,25 @@ refreshFarmUI()
                 setStatus(t("fail"), Theme.danger)
             end
         end
+
+        local observedCamera
+        local function observeViewport()
+            local workspaceService = Flow.Services.Workspace
+            local camera = workspaceService and workspaceService.CurrentCamera
+            if not camera or camera == observedCamera then return end
+            observedCamera = camera
+            Flow:Track(camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+                updateLayout(true)
+            end))
+        end
+        if Flow.Services.Workspace then
+            Flow:Track(Flow.Services.Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+                observedCamera = nil
+                observeViewport()
+                updateLayout(true)
+            end))
+        end
+        observeViewport()
 
         -- Native portal confirmation modal. It appears only if a profile has no
         -- positive inventory evidence and the player explicitly turns the option on.
@@ -13231,6 +13519,16 @@ refreshFarmUI()
         end, lucide.target)
 
         local _, speedInput = optionInput(islandsList, t("travel_speed"), t("travel_speed_desc"), State.teleportSpeed, lucide.speed)
+        Flow.Runtime.antiWaterToggle = select(2, Theme.OptionRow(islandsList, t("anti_water"), t("anti_water_desc"), function(active)
+            State.antiWaterEnabled = active
+            Config:Save()
+            setStatus(t("saved"), Theme.success)
+        end, lucide.travel))
+        Flow.Runtime.antiImpassableToggle = select(2, Theme.OptionRow(islandsList, t("anti_impassable"), t("anti_impassable_desc"), function(active)
+            State.antiImpassableEnabled = active
+            Config:Save()
+            setStatus(t("saved"), Theme.success)
+        end, lucide.travel))
         local worldPortalRow
         worldPortalRow, worldPortalToggle = Theme.OptionRow(islandsList, t("use_world_portals"), t("use_world_portals_desc"), function(active)
             if not active then
@@ -13825,41 +14123,7 @@ refreshFarmUI()
         stylePadding.PaddingBottom = UDim.new(0, 6)
         stylePadding.Parent = styleList
 
-        local _, widthInput = optionInput(styleList, t("layout_width"), t("layout_width_desc"), State.layoutWidth, lucide.style)
-        local _, heightInput = optionInput(styleList, t("layout_height"), t("layout_height_desc"), State.layoutHeight, lucide.style)
-        local scaleRow = frame(styleList, {
-            Size = UDim2.new(1, 0, 0, 56),
-            BackgroundColor3 = Theme.panel2,
-            Active = true,
-        }, 8)
-        label(scaleRow, {
-            Size = UDim2.new(1, -22, 0, 18),
-            Position = UDim2.new(0, 11, 0, 9),
-            Text = t("layout_scale"),
-            TextSize = 13,
-            Font = Enum.Font.GothamBold,
-        })
-        local scaleText = label(scaleRow, {
-            Size = UDim2.new(0, 78, 0, 16),
-            Position = UDim2.new(0, 11, 0, 30),
-            Text = "1.00x",
-            TextSize = 10,
-            TextColor3 = Theme.muted,
-        })
-        local scaleSlider = Theme.Slider(scaleRow, State.layoutScale, 0.8, 1.25, function(value)
-            State.layoutScale = math.floor(value * 100) / 100
-            scaleText.Text = string.format("%.2fx", State.layoutScale)
-            updateLayout()
-            Config:Save()
-        end)
-        scaleSlider.Frame.Position = UDim2.new(1, -164, 0.5, -3)
-        scaleRow.MouseEnter:Connect(function()
-            scaleRow.BackgroundColor3 = Theme.panel3
-        end)
-        scaleRow.MouseLeave:Connect(function()
-            scaleRow.BackgroundColor3 = Theme.panel2
-        end)
-
+        local hubSizeControls
         do
             local Notification = Flow.Features and Flow.Features.Notifications
             local function optionCard(title, description, choices, current, onSelect)
@@ -13874,14 +14138,29 @@ refreshFarmUI()
                     control.Position = UDim2.new(0, 11 + ((index - 1) * (width + 5)), 1, -34)
                     controls[choice.key] = control
                     control.MouseButton1Click:Connect(function()
-                        if not Notification then return end
                         local ok = onSelect(choice.key)
                         if not ok then return end
                         for key, buttonControl in pairs(controls) do buttonControl.BackgroundColor3 = key == choice.key and Theme.accent or Theme.panel3 end
-                        Notification:Info(t("notifications"), t("notification_updated"), { duration = 2.5 })
+                        if Notification then Notification:Info(t("notifications"), t("notification_updated"), { duration = 2.5 }) end
                     end)
                 end
+                return controls
             end
+            hubSizeControls = optionCard(t("hub_size"), t("hub_size_desc"), {
+                { key = "small", label = t("hub_size_small") },
+                { key = "normal", label = t("hub_size_normal") },
+                { key = "large", label = t("hub_size_large") },
+            }, function()
+                return State.layoutSize or "normal"
+            end, function(value)
+                State.layoutSize = value
+                State.layoutScale = layoutPresets[value] or 1
+                updateLayout(true)
+                Config:Save()
+                setStatus(t("saved"), Theme.success)
+                return true
+            end)
+
             if Notification then
                 optionCard(t("notification_position"), t("notification_position_desc"), {
                     { key = "bottom_right", label = t("notification_bottom_right") }, { key = "bottom_left", label = t("notification_bottom_left") },
@@ -14312,14 +14591,17 @@ refreshFarmUI()
             end
             if Flow.Runtime.raidControls and Flow.Runtime.raidControls.refresh then Flow.Runtime.raidControls.refresh() end
             fallbackToggle:Set(State.directFallback, true)
+            if Flow.Runtime.antiWaterToggle then Flow.Runtime.antiWaterToggle:Set(State.antiWaterEnabled, true) end
+            if Flow.Runtime.antiImpassableToggle then Flow.Runtime.antiImpassableToggle:Set(State.antiImpassableEnabled, true) end
             antiAfkToggle:Set(State.antiAfkEnabled, true)
             removeFogToggle:Set(State.removeFogEnabled, true)
             speedInput.Text = tostring(State.teleportSpeed)
             delayInput.Text = tostring(State.portalDelay)
-            widthInput.Text = tostring(State.layoutWidth)
-            heightInput.Text = tostring(State.layoutHeight)
-            scaleSlider:Set(State.layoutScale, true)
-            scaleText.Text = string.format("%.2fx", State.layoutScale)
+            if hubSizeControls then
+                for key, control in pairs(hubSizeControls) do
+                    control.BackgroundColor3 = key == (State.layoutSize or "normal") and Theme.accent or Theme.panel3
+                end
+            end
             main.Position = UDim2.new(State.hubPosition[1], State.hubPosition[2], State.hubPosition[3], State.hubPosition[4])
             compact.Position = UDim2.new(State.ballPosition[1], State.ballPosition[2], State.ballPosition[3], State.ballPosition[4])
             updateLayout()
@@ -14417,12 +14699,6 @@ refreshFarmUI()
         end))
         Flow:Track(delayInput.FocusLost:Connect(function()
             updateNumber(delayInput, "portalDelay", 0, 30)
-        end))
-        Flow:Track(widthInput.FocusLost:Connect(function()
-            updateNumber(widthInput, "layoutWidth", 480, 1000)
-        end))
-        Flow:Track(heightInput.FocusLost:Connect(function()
-            updateNumber(heightInput, "layoutHeight", 340, 720)
         end))
         Flow:Track(equipPortal.MouseButton1Click:Connect(function()
             setStatus(t("equip_status"), Theme.muted)
