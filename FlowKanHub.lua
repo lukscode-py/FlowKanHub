@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.42"
+    Flow.Version = "1.14.43"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -172,6 +172,10 @@ end)(Flow)
             mansion = "unknown",
             hydra = "unknown",
         },
+        -- Each available map portal must carry a profile-scoped proof source.
+        -- A legacy `available` flag by itself is never sufficient to route.
+        worldPortalEvidence = { tiki = "none", mansion = "none", hydra = "none" },
+        worldPortalValidationRevision = 2,
         worldPortalsInitialized = false,
         portalDelay = 2,
         directFallback = true,
@@ -314,7 +318,19 @@ end)(Flow)
         if type(data.usePortal) == "boolean" then state.usePortal = data.usePortal end
         if type(data.useWorldPortals) == "boolean" then state.useWorldPortals = data.useWorldPortals end
         if type(data.worldPortalStatus) == "table" then state.worldPortalStatus = copy(data.worldPortalStatus) end
+        if type(data.worldPortalEvidence) == "table" then state.worldPortalEvidence = copy(data.worldPortalEvidence) end
         if type(data.worldPortalsInitialized) == "boolean" then state.worldPortalsInitialized = data.worldPortalsInitialized end
+        -- Earlier profiles persisted only `available`, so a stale or broad
+        -- getgc match could let a route use Tiki without a key-specific proof.
+        -- Revalidate once from the current profile inventory or an explicit
+        -- physical manual test before any portal is eligible again.
+        if (tonumber(data.worldPortalValidationRevision) or 0) < 2 then
+            state.worldPortalStatus = { tiki = "unknown", mansion = "unknown", hydra = "unknown" }
+            state.worldPortalEvidence = { tiki = "none", mansion = "none", hydra = "none" }
+            state.worldPortalsInitialized = false
+            state.useWorldPortals = false
+        end
+        state.worldPortalValidationRevision = 2
 
         local portalDelay = legacy and data.esperaPortal or data.portalDelay
         if type(portalDelay) == "number" then state.portalDelay = math.max(0, math.min(30, portalDelay)) end
@@ -416,6 +432,8 @@ end)(Flow)
             usePortal = state.usePortal,
             useWorldPortals = state.useWorldPortals,
             worldPortalStatus = copy(state.worldPortalStatus),
+            worldPortalEvidence = copy(state.worldPortalEvidence),
+            worldPortalValidationRevision = state.worldPortalValidationRevision,
             worldPortalsInitialized = state.worldPortalsInitialized,
             portalDelay = state.portalDelay,
             directFallback = state.directFallback,
@@ -2171,6 +2189,9 @@ end)(Flow)
         locked = true,
         temporarily_unavailable = true,
     }
+    -- `available` is usable only with a key-specific proof from the current
+    -- profile: strict inventory evidence or a successful physical test.
+    local validEvidence = { inventory = true, manual = true }
 
     local function clamp(value, minimum, maximum)
         return math.max(minimum, math.min(maximum, value))
@@ -2203,8 +2224,13 @@ end)(Flow)
     function WorldPortals:EnsureState()
         local state = Flow.State
         state.worldPortalStatus = type(state.worldPortalStatus) == "table" and state.worldPortalStatus or {}
+        state.worldPortalEvidence = type(state.worldPortalEvidence) == "table" and state.worldPortalEvidence or {}
         for _, key in ipairs({"tiki", "mansion", "hydra"}) do
-            if not validStatus[state.worldPortalStatus[key]] then
+            if not validStatus[state.worldPortalStatus[key]] then state.worldPortalStatus[key] = "unknown" end
+            if not validEvidence[state.worldPortalEvidence[key]] then state.worldPortalEvidence[key] = "none" end
+            -- Never honor a historic bare `available` value without the source
+            -- that proved this exact portal for this exact profile.
+            if state.worldPortalStatus[key] == "available" and state.worldPortalEvidence[key] == "none" then
                 state.worldPortalStatus[key] = "unknown"
             end
         end
@@ -2217,18 +2243,35 @@ end)(Flow)
         return Flow.State.worldPortalStatus[key] or "unknown"
     end
 
-    function WorldPortals:SetStatus(key, status)
+    function WorldPortals:GetEvidence(key)
+        self:EnsureState()
+        return Flow.State.worldPortalEvidence[key] or "none"
+    end
+
+    function WorldPortals:IsConfirmed(key)
+        return self:GetStatus(key) == "available" and validEvidence[self:GetEvidence(key)] == true
+    end
+
+    function WorldPortals:SetStatus(key, status, evidence)
         self:EnsureState()
         if not validStatus[status] then return false end
-        if self:GetStatus(key) == status then return false end
-        Flow.State.worldPortalStatus[key] = status
+        if status == "available" and not validEvidence[evidence] then return false end
+        local state = Flow.State
+        local oldStatus, oldEvidence = self:GetStatus(key), self:GetEvidence(key)
+        if oldStatus == status and (status ~= "available" or oldEvidence == evidence) then return false end
+        state.worldPortalStatus[key] = status
+        if status == "available" then
+            state.worldPortalEvidence[key] = evidence
+        elseif status == "locked" then
+            state.worldPortalEvidence[key] = "manual_locked"
+        end
         return true
     end
 
     function WorldPortals:HasAvailable()
         self:EnsureState()
         for _, key in ipairs({"tiki", "mansion", "hydra"}) do
-            if self:GetStatus(key) == "available" then return true end
+            if self:IsConfirmed(key) then return true end
         end
         return false
     end
@@ -2237,7 +2280,7 @@ end)(Flow)
         self:EnsureState()
         local keys = {}
         for _, key in ipairs({"tiki", "mansion", "hydra"}) do
-            if self:GetStatus(key) ~= "available" then table.insert(keys, key) end
+            if not self:IsConfirmed(key) then table.insert(keys, key) end
         end
         return keys
     end
@@ -2288,7 +2331,8 @@ end)(Flow)
                             -- false means "owned but not equipped" and is valid evidence.
                             local equipped = readField(record, "Equipped")
                             if equipped == nil then equipped = readField(record, "equipped") end
-                            if type(equipped) == "boolean" and namedEntries >= 2 then
+                            local itemType = lower(readField(record, "Type") or readField(record, "type"))
+                            if itemType == "accessory" and type(equipped) == "boolean" and namedEntries >= 2 then
                                 evidence.indra = true
                             end
                         else
@@ -2296,7 +2340,11 @@ end)(Flow)
                             if amount == nil then amount = readField(record, "amount") end
                             if amount == nil then amount = readField(record, "Count") end
                             if amount == nil then amount = readField(record, "count") end
-                            if type(amount) == "number" and amount > 0 then
+                            local itemType = lower(readField(record, "Type") or readField(record, "type"))
+                            -- Moonstone / Fire Feather are valid only from a
+                            -- record that is shaped like the player's Material
+                            -- inventory, never from an arbitrary getgc table.
+                            if itemType == "material" and type(amount) == "number" and amount > 0 then
                                 evidence.tyrant = true
                             end
                         end
@@ -2307,11 +2355,11 @@ end)(Flow)
 
         local changed = false
         if evidence.indra then
-            changed = self:SetStatus("mansion", "available") or changed
-            changed = self:SetStatus("hydra", "available") or changed
+            changed = self:SetStatus("mansion", "available", "inventory") or changed
+            changed = self:SetStatus("hydra", "available", "inventory") or changed
         end
         if evidence.tyrant then
-            changed = self:SetStatus("tiki", "available") or changed
+            changed = self:SetStatus("tiki", "available", "inventory") or changed
         end
         return changed, evidence
     end
@@ -2479,7 +2527,7 @@ end)(Flow)
         local exited, exitReason = self:ExitHitbox(arrivalHitbox, finalPosition or edge.landing, ticket)
         if not exited then return false, exitReason end
         self:RecordMetric("settle", 0.2)
-        self:SetStatus(edge.key, "available")
+        self:SetStatus(edge.key, "available", "manual")
         return true
     end
 
@@ -2523,7 +2571,7 @@ end)(Flow)
         end
         local function consider(fromPosition, elapsed, edges, used, labels)
             for edgeName, edge in pairs(self.Edges) do
-                if not used[edgeName] and self:GetStatus(edge.key) == "available" then
+                if not used[edgeName] and self:IsConfirmed(edge.key) then
                     local edgeSeconds = self:GetEdgeSeconds(fromPosition, edge, speed)
                     if edgeSeconds < math.huge then
                         local totalBeforeFinal = elapsed + edgeSeconds
@@ -2588,20 +2636,27 @@ end)(Flow)
         local tested, available = {}, {}
         local ok, runtimeError = xpcall(function()
             for _, item in ipairs(self.TestOrder) do
-                if self:GetStatus(item.key) ~= "available" then
+                if not self:IsConfirmed(item.key) then
                     local forward = self.Edges[item.forward]
                     local forwardOk, forwardReason = self:UseEdge(forward, ticket, forward.landing)
                     table.insert(tested, {key = item.key, direction = "forward", ok = forwardOk, reason = forwardReason})
                     if forwardOk then
-                        self:SetStatus(item.key, "available")
+                        self:SetStatus(item.key, "available", "manual")
                         table.insert(available, item.key)
 
                         -- The return edge is tested too so the player finishes back at Castle.
                         local backward = self.Edges[item.backward]
                         local backOk, backReason = self:UseEdge(backward, ticket, backward.landing)
                         table.insert(tested, {key = item.key, direction = "return", ok = backOk, reason = backReason})
+                    elseif forwardReason == "no_native_arrival" then
+                        -- During an explicit user-approved test, entering the
+                        -- live hitbox without a native arrival is a meaningful
+                        -- locked result for this profile/key.
+                        self:SetStatus(item.key, "locked")
                     elseif teleport:IsCancelled(ticket) then
                         break
+                    else
+                        self:SetStatus(item.key, "temporarily_unavailable")
                     end
                 end
             end
