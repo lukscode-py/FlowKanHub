@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.40"
+    Flow.Version = "1.14.42"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -191,6 +191,9 @@ end)(Flow)
         -- Session-only confirmation for the level-2800 final-quest loop.
         -- It is not serialized, so a new activation always asks again.
         farmAtMaxConfirmed = false,
+        -- A late Data.Level load can discover the cap just after an activation.
+        -- UI consumes this session-only flag and opens the explicit modal.
+        farmCapPromptPending = false,
         farmAutoAttack = true,
         farmBringMobs = true,
         farmBringRadius = 450,
@@ -201,7 +204,10 @@ end)(Flow)
         -- Existing profiles migrate once without overriding later user choices.
         farmHoverRevision = 1,
         farmWeaponName = "",
-        farmWeaponType = "",
+        -- Fighting Style is the safe default. A player can still choose Sword
+        -- explicitly, and existing Sword selections are never overwritten.
+        farmWeaponType = "Melee",
+        farmWeaponDefaultRevision = 1,
         -- Passive only. It may resume a recorder but never starts or controls a raid.
         raidMonitorEnabled = false,
         -- Passive telemetry of Hub-owned state/actions; never a network spy.
@@ -338,6 +344,12 @@ end)(Flow)
         state.farmHoverRevision = 1
         if type(data.farmWeaponName) == "string" then state.farmWeaponName = data.farmWeaponName end
         if type(data.farmWeaponType) == "string" then state.farmWeaponType = data.farmWeaponType end
+        -- Migrate only profiles that had no type selected. A deliberate Sword
+        -- or Fighting Style selection remains untouched.
+        if (tonumber(data.farmWeaponDefaultRevision) or 0) < 1 and state.farmWeaponType == "" then
+            state.farmWeaponType = "Melee"
+        end
+        state.farmWeaponDefaultRevision = 1
         if type(data.raidMonitorEnabled) == "boolean" then state.raidMonitorEnabled = data.raidMonitorEnabled end
         if type(data.telemetryEnabled) == "boolean" then state.telemetryEnabled = data.telemetryEnabled end
         if type(data.raidType) == "string" and validRaidTypes[data.raidType] then state.raidType = data.raidType end
@@ -425,6 +437,7 @@ end)(Flow)
             farmHoverRevision = state.farmHoverRevision,
             farmWeaponName = state.farmWeaponName,
             farmWeaponType = state.farmWeaponType,
+            farmWeaponDefaultRevision = state.farmWeaponDefaultRevision,
             raidMonitorEnabled = state.raidMonitorEnabled,
             telemetryEnabled = state.telemetryEnabled,
             raidType = state.raidType,
@@ -4431,7 +4444,11 @@ end)(Flow)
         self.State.priorityPauseReason = nil
         local level = self:GetLevel()
         if level >= self.MaxQuestLevel and not State.farmAtMaxConfirmed then
-            self:ClearHover(); self:SetPhase("farm_cap", "level_cap", nil, nil); self:SetEnabled(false, true); return false
+            -- Data.Level can become available just after the toggle is pressed.
+            -- Stop safely, but hand the decision back to the UI instead of
+            -- silently cancelling Farm at the cap.
+            State.farmCapPromptPending = true
+            self:ClearHover(); self:SetPhase("farm_cap", "level_cap", nil, nil); self:SetEnabled(false); return false
         end
         if not self:HasSelectedWeapon() then self:ClearHover(); self:SetPhase("weapon_missing", "weapon_missing", nil, nil); return true end
         local quest, questReason = self:ResolveQuest()
@@ -4523,6 +4540,7 @@ end)(Flow)
         if enabled and self:IsAtQuestCap() and confirmedAtMax ~= true then
             State.farmLevelEnabled = false
             State.farmAtMaxConfirmed = false
+            State.farmCapPromptPending = true
             Flow.Config:Save()
             self:SetPhase("farm_cap", "level_cap", nil, nil)
             return false, "farm_cap_confirmation"
@@ -4531,6 +4549,7 @@ end)(Flow)
             return true
         end
         State.farmLevelEnabled = enabled
+        if enabled and confirmedAtMax == true then State.farmCapPromptPending = false end
         -- This consent is intentionally session-only. Every fresh activation at
         -- the regular quest cap presents the confirmation instead of silently
         -- resuming the final quest after a reload.
@@ -11852,14 +11871,18 @@ farmLevelRow, farmToggle = Theme.OptionRow(farmGeneralList, t("farm_level"), t("
         farmToggle:Set(false, true)
         return
     end
+    -- Cap consent always takes precedence over weapon validation. Otherwise a
+    -- player at level 2800 with no saved type sees the toggle turn off and
+    -- never receives the Cancel / Enable choice.
+    if active and Farm:IsAtQuestCap() then
+        State.farmCapPromptPending = false
+        farmToggle:Set(false, true)
+        if maxFarmOverlay then maxFarmOverlay.Visible = true end
+        return
+    end
     if active and (State.farmWeaponType ~= "Melee" and State.farmWeaponType ~= "Sword") then
         farmToggle:Set(false, true)
         if setStatus then setStatus(t("farm_no_weapon"), Theme.danger) end
-        return
-    end
-    if active and Farm:IsAtQuestCap() then
-        farmToggle:Set(false, true)
-        if maxFarmOverlay then maxFarmOverlay.Visible = true end
         return
     end
     local ok, reason = Farm:SetEnabled(active)
@@ -12033,10 +12056,12 @@ maxFarmActivate.Position = UDim2.new(1, -179, 1, -45)
 maxFarmActivate.ZIndex = 182
 maxFarmCancel.MouseButton1Click:Connect(function()
     maxFarmOverlay.Visible = false
+    State.farmCapPromptPending = false
     farmToggle:Set(false, true)
 end)
 maxFarmActivate.MouseButton1Click:Connect(function()
     maxFarmOverlay.Visible = false
+    State.farmCapPromptPending = false
     local ok, reason = false, "farm_unavailable"
     if Farm then ok, reason = Farm:SetEnabled(true, true) end
     farmToggle:Set(ok, true)
@@ -12093,6 +12118,13 @@ end
 local function refreshFarmUI()
     local snapshot = Farm and Farm:GetSnapshot() or {}
     farmToggle:Set(State.farmLevelEnabled, true)
+    -- Covers a late Data.Level replication: Farm stops safely and marks this
+    -- session-only request, then the visible page opens the same explicit modal.
+    if State.farmCapPromptPending and maxFarmOverlay and not maxFarmOverlay.Visible then
+        State.farmCapPromptPending = false
+        farmToggle:Set(false, true)
+        maxFarmOverlay.Visible = true
+    end
     farmAutoAttackToggle:Set(State.farmAutoAttack, true)
     farmBringToggle:Set(State.farmBringMobs, true)
     farmRadiusInput.Text = tostring(State.farmBringRadius)
@@ -12155,6 +12187,11 @@ refreshFarmUI()
             radiusInput = farmRadiusInput,
             heightInput = farmHeightInput,
             refresh = refreshFarmUI,
+            showCapPrompt = function()
+                State.farmCapPromptPending = false
+                farmToggle:Set(false, true)
+                if maxFarmOverlay then maxFarmOverlay.Visible = true end
+            end,
         }
     end
 
@@ -14586,7 +14623,12 @@ refreshFarmUI()
                 farmControls.toggle:Set(State.farmLevelEnabled, true)
                 farmControls.autoAttackToggle:Set(State.farmAutoAttack, true)
                 farmControls.bringToggle:Set(State.farmBringMobs, true)
-                if Farm and State.farmLevelEnabled then Farm:SetEnabled(true) end
+                if Farm and State.farmLevelEnabled then
+                    local enabled, reason = Farm:SetEnabled(true)
+                    if not enabled and reason == "farm_cap_confirmation" and farmControls.showCapPrompt then
+                        farmControls.showCapPrompt()
+                    end
+                end
                 farmControls.refresh()
             end
             if Flow.Runtime.raidControls and Flow.Runtime.raidControls.refresh then Flow.Runtime.raidControls.refresh() end
