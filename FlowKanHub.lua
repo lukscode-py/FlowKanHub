@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.52"
+    Flow.Version = "1.14.54"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -118,6 +118,8 @@ local Flow = {Build = "bundled"}
         if priority and priority.Shutdown then pcall(function() priority:Shutdown() end) end
         local telemetry = self.Features and self.Features.SystemTelemetry
         if telemetry and telemetry.Shutdown then pcall(function() telemetry:Shutdown() end) end
+        local autoCombat = self.Features and self.Features.AutoCombat
+        if autoCombat and autoCombat.Shutdown then pcall(function() autoCombat:Shutdown() end) end
         local farm = self.Features and self.Features.Farm
         if farm and farm.Shutdown then pcall(function() farm:Shutdown() end) end
         local raid = self.Features and self.Features.Raid
@@ -206,6 +208,12 @@ end)(Flow)
         -- UI consumes this session-only flag and opens the explicit modal.
         farmCapPromptPending = false,
         farmAutoAttack = true,
+        -- Settings → Combat defaults to nearby targets at all times. It only
+        -- uses a presently equipped Melee/Sword and never moves/equips for the
+        -- player. These are intentionally independent of quest Farm.
+        autoCombatMobs = true,
+        autoCombatPlayers = true,
+        autoCombatDefaultsRevision = 1,
         farmBringMobs = true,
         farmBringRadius = 450,
         farmControlMode = "above",
@@ -373,6 +381,15 @@ end)(Flow)
         if type(data.removeFogEnabled) == "boolean" then state.removeFogEnabled = data.removeFogEnabled end
         if type(data.farmLevelEnabled) == "boolean" then state.farmLevelEnabled = data.farmLevelEnabled end
         if type(data.farmAutoAttack) == "boolean" then state.farmAutoAttack = data.farmAutoAttack end
+        if type(data.autoCombatMobs) == "boolean" then state.autoCombatMobs = data.autoCombatMobs end
+        if type(data.autoCombatPlayers) == "boolean" then state.autoCombatPlayers = data.autoCombatPlayers end
+        -- First delivery intentionally activates both requested Combat toggles
+        -- for existing profiles. Future saved choices are always preserved.
+        if (tonumber(data.autoCombatDefaultsRevision) or 0) < 1 then
+            state.autoCombatMobs = true
+            state.autoCombatPlayers = true
+        end
+        state.autoCombatDefaultsRevision = 1
         if type(data.farmBringMobs) == "boolean" then state.farmBringMobs = data.farmBringMobs end
         if type(data.farmBringRadius) == "number" then state.farmBringRadius = math.max(60, math.min(600, data.farmBringRadius)) end
         if type(data.farmControlMode) == "string" and (data.farmControlMode == "above" or data.farmControlMode == "orbit" or data.farmControlMode == "star") then state.farmControlMode = data.farmControlMode end
@@ -479,6 +496,9 @@ end)(Flow)
             removeFogEnabled = state.removeFogEnabled,
             farmLevelEnabled = state.farmLevelEnabled,
             farmAutoAttack = state.farmAutoAttack,
+            autoCombatMobs = state.autoCombatMobs,
+            autoCombatPlayers = state.autoCombatPlayers,
+            autoCombatDefaultsRevision = state.autoCombatDefaultsRevision,
             farmBringMobs = state.farmBringMobs,
             farmBringRadius = state.farmBringRadius,
             farmControlMode = state.farmControlMode,
@@ -993,6 +1013,12 @@ end)(Flow)
         -- Keeps gravity from accumulating during the post-route server-arrival
         -- observation. It never writes CFrame or blocks reconciliation.
         ticket.holdArrivalVelocity = options.holdArrivalVelocity == true
+        -- Local combat arrival is already preceded by a bounded direct route.
+        -- It may opt into a short reconciliation sample, never zero: the
+        -- standard 1.2 s confirmation remains the default for world travel.
+        if type(options.arrivalConfirmSeconds) == "number" then
+            ticket.arrivalConfirmSeconds = math.max(0.20, math.min(self.ArrivalConfirmSeconds, options.arrivalConfirmSeconds))
+        end
         if type(options.maxAttempts) == "number" then
             ticket.maxAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(options.maxAttempts)))
         end
@@ -1430,7 +1456,9 @@ end)(Flow)
     function Teleport:ConfirmArrival(position, ticket)
         local root = self:GetRoot()
         if not root or not position then return false, "arrival_root_missing" end
-        local deadline = os.clock() + self.ArrivalConfirmSeconds
+        local observationSeconds = ticket and tonumber(ticket.arrivalConfirmSeconds) or self.ArrivalConfirmSeconds
+        observationSeconds = math.max(0.20, math.min(self.ArrivalConfirmSeconds, observationSeconds or self.ArrivalConfirmSeconds))
+        local deadline = os.clock() + observationSeconds
         local last = root.Position
         local largestStep = 0
         repeat
@@ -3771,7 +3799,11 @@ end)(Flow)
     -- Any larger shift is a new usable group/wave. It is deliberately well
     -- below the verified +30 combat reach, so a stale anchor never leaves an
     -- already-spawned target outside RegisterHit range.
-    Farm.CombatAnchorShift = 40
+    -- Live 120-second trace showed a fixed 40-stud anchor can leave a roaming
+    -- target just beyond the 80-stud hit radius (after the 30-stud hover gap).
+    -- Re-anchor a little earlier; this is a discrete cluster read, never NPC
+    -- manipulation or a per-frame player follow.
+    Farm.CombatAnchorShift = 25
     -- Hover is deliberately tolerant. Rewriting the character CFrame every
     -- Heartbeat competes with Android/server replication and creates a visible
     -- up/down correction loop. The stabilizer holds only vertical gravity;
@@ -4694,6 +4726,11 @@ end)(Flow)
                 -- Keep velocity neutral during it so a safe route never turns
                 -- into a visible gravity fall before Farm re-reads its anchor.
                 holdArrivalVelocity = true,
+                -- The live target trace reached visible close range about 1.5 s
+                -- before combat because the generic world-route confirmation
+                -- always observed for 1.2 s. Keep a real reconciliation check,
+                -- but shrink this known local combat sample to 0.25 s.
+                arrivalConfirmSeconds = 0.25,
                 maxAttempts = 1,
             })
         end
@@ -4918,12 +4955,26 @@ end)(Flow)
     -- cooldown, removing the old 0.25 s -> ~0.36 s loop quantization.
     function Farm:StartAttackPulse()
         local state = self.State
+        -- Settings → Combat owns the continuous nearby-mob cadence whenever it
+        -- is enabled. Farm still owns quest, anchor and hover work, but must
+        -- never send a duplicate second attack stream for the same enemy.
+        local autoCombat = Flow.Features and Flow.Features.AutoCombat
+        if autoCombat and autoCombat.IsMobEnabled and autoCombat:IsMobEnabled() then
+            self:StopAttackPulse()
+            state.lastAttackReason = "settings_auto_combat_mobs"
+            return
+        end
         if state.attackPulseRunning then return end
         state.attackPulseRunning = true
         state.attackPulseId = (state.attackPulseId or 0) + 1
         local pulseId, generation = state.attackPulseId, state.generation
         task.spawn(function()
             while State.farmLevelEnabled and state.generation == generation and state.attackPulseId == pulseId and state.phase == "combat" do
+                local autoCombat = Flow.Features and Flow.Features.AutoCombat
+                if autoCombat and autoCombat.IsMobEnabled and autoCombat:IsMobEnabled() then
+                    state.lastAttackReason = "settings_auto_combat_mobs"
+                    break
+                end
                 self:UpdateAttackFeedback()
                 local now = os.clock()
                 local cooldown = math.max(0.25, state.adaptiveAttackCooldown or 0.25)
@@ -5155,7 +5206,11 @@ end)(Flow)
         self:SetCombatAnchor(quest, center)
         local anchor = self.State.combatAnchor or center
         local target = cluster[1] and cluster[1].model or self:FindTarget(quest.mob)
-        local root = self:GetRoot(); local desired = self:GetAnchorControlCFrame(anchor)
+        -- A player-selected orbit/star layout is useful while waiting at a
+        -- spawn, but it is counterproductive in live combat: it makes the
+        -- hover circle a fixed anchor while a Grand Devotee walks away. Combat
+        -- always holds the stable vertical point directly above its anchor.
+        local root = self:GetRoot(); local desired = self:GetAnchorControlCFrame(anchor, "above")
         if not target or not root or not desired then self:ClearHover(); self:SetPhase("character_missing", "character_missing", quest, target); return true end
         if (root.Position - desired.Position).Magnitude > 150 then
             self:ClearHover(); self:SetPhase("approaching_target", "approaching_target", quest, target)
@@ -5163,7 +5218,7 @@ end)(Flow)
             if not moved then self:SetPhase("movement_failed", moveReason or "movement_failed", quest, nil) end
             return true
         end
-        self:BeginHoverAt(anchor, false)
+        self:BeginHoverAt(anchor, false, nil, nil, nil, "above")
         self:SetPhase("combat", "combat", quest, target)
         self:BringMobs(target, anchor)
         -- Attack owns its own exact cooldown pulse; Step remains responsible
@@ -5236,6 +5291,230 @@ end)(Flow)
     end
 
     Flow.Features.Farm = Farm
+end)(Flow)
+
+-- >>> MODULE: features/combat/auto_combat.lua
+;(function(Flow)
+    local AutoCombat = {}
+    local State = Flow.State
+    local Services = Flow.Services
+    local player = Flow.Player
+    local players = Services.Players
+    local workspace = Services.Workspace
+    local replicatedStorage = Services.ReplicatedStorage
+
+    AutoCombat.Reach = 80
+    AutoCombat.Interval = 0.25
+    AutoCombat.State = {
+        running = false,
+        generation = 0,
+        lastAttackAt = -math.huge,
+        lastReason = "idle",
+        attempts = 0,
+        mobTargets = 0,
+        playerTargets = 0,
+        lastTargetCount = 0,
+    }
+
+    local function modelRoot(model)
+        return model and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart) or nil
+    end
+
+    local function alive(model)
+        local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+        return model and humanoid and humanoid.Health > 0 and modelRoot(model) ~= nil
+    end
+
+    local function preferredHitPart(model)
+        if not model then return nil end
+        for _, name in ipairs({"RightLowerArm", "RightUpperArm", "LeftLowerArm", "LeftUpperArm", "RightHand", "LeftHand"}) do
+            local part = model:FindFirstChild(name)
+            if part and part:IsA("BasePart") then return part end
+        end
+        return model.PrimaryPart or modelRoot(model)
+    end
+
+    function AutoCombat:Record(kind, detail)
+        local telemetry = Flow.Features and Flow.Features.SystemTelemetry
+        if telemetry and telemetry.Record then
+            pcall(function() telemetry:Record(kind, "auto_combat|" .. tostring(detail or "")) end)
+        end
+    end
+
+    function AutoCombat:IsMobEnabled()
+        return State.autoCombatMobs == true
+    end
+
+    function AutoCombat:IsPlayerEnabled()
+        return State.autoCombatPlayers == true
+    end
+
+    function AutoCombat:IsActive()
+        return self:IsMobEnabled() or self:IsPlayerEnabled()
+    end
+
+    function AutoCombat:GetCharacter()
+        return player and player.Character or nil
+    end
+
+    function AutoCombat:GetRoot()
+        return modelRoot(self:GetCharacter())
+    end
+
+    -- Global combat intentionally requires an already equipped melee/sword.
+    -- It never changes the player's held tool, preserving manual choice and
+    -- avoiding a race with Farm/Raid equip gates.
+    function AutoCombat:GetEligibleTool()
+        local character = self:GetCharacter()
+        if not character then return nil end
+        for _, item in ipairs(character:GetChildren()) do
+            if item:IsA("Tool") and (item.ToolTip == "Melee" or item.ToolTip == "Sword") then
+                return item, item.ToolTip
+            end
+        end
+        return nil
+    end
+
+    function AutoCombat:GetCombatRemotes()
+        local farm = Flow.Features and Flow.Features.Farm
+        if farm and farm.GetCombatRemotes then return farm:GetCombatRemotes() end
+        local modules = replicatedStorage and replicatedStorage:FindFirstChild("Modules")
+        local net = modules and modules:FindFirstChild("Net")
+        local attack = net and net:FindFirstChild("RE/RegisterAttack")
+        local hit = net and net:FindFirstChild("RE/RegisterHit")
+        if attack and hit and attack:IsA("RemoteEvent") and hit:IsA("RemoteEvent") then return attack, hit end
+        return nil, nil
+    end
+
+    function AutoCombat:GetSendHitsToServer()
+        local farm = Flow.Features and Flow.Features.Farm
+        if farm and farm.HasCombatRemoteThread and farm.GetSendHitsToServer and farm:HasCombatRemoteThread() then
+            return farm:GetSendHitsToServer()
+        end
+        return nil
+    end
+
+    function AutoCombat:AddTarget(model, kind, root, hitData, health, seen)
+        if not model or seen[model] or not alive(model) or not root then return false end
+        local targetRoot = modelRoot(model)
+        if not targetRoot or (targetRoot.Position - root.Position).Magnitude > self.Reach then return false end
+        local part = preferredHitPart(model)
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if not part or not humanoid then return false end
+        seen[model] = true
+        table.insert(hitData, {model, part})
+        health[model] = humanoid.Health
+        if kind == "player" then self.State.playerTargets = self.State.playerTargets + 1 else self.State.mobTargets = self.State.mobTargets + 1 end
+        return true
+    end
+
+    function AutoCombat:GetNearbyHitData()
+        local root = self:GetRoot()
+        if not root then return nil, nil, nil end
+        local hitData, health, seen = {}, {}, {}
+        self.State.mobTargets, self.State.playerTargets = 0, 0
+
+        if self:IsMobEnabled() then
+            local enemies = workspace and workspace:FindFirstChild("Enemies")
+            if enemies then
+                for _, enemy in ipairs(enemies:GetChildren()) do
+                    self:AddTarget(enemy, "mob", root, hitData, health, seen)
+                end
+            end
+        end
+
+        if self:IsPlayerEnabled() and players then
+            for _, other in ipairs(players:GetPlayers()) do
+                if other ~= player then
+                    self:AddTarget(other.Character, "player", root, hitData, health, seen)
+                end
+            end
+        end
+
+        if #hitData == 0 then return nil, hitData, health end
+        return hitData[1][2], hitData, health
+    end
+
+    function AutoCombat:AttackNearby()
+        if not self:IsActive() then return false, "disabled" end
+        local now = os.clock()
+        if now - (self.State.lastAttackAt or -math.huge) < self.Interval then return false, "cooldown" end
+
+        local tool, toolType = self:GetEligibleTool()
+        if not tool then return false, "eligible_tool_not_equipped" end
+        local attack, hit = self:GetCombatRemotes()
+        if not attack or not hit then return false, "combat_remotes_unavailable" end
+        local primary, hitData = self:GetNearbyHitData()
+        if not primary or #hitData == 0 then return false, "no_target_in_reach" end
+
+        -- Normal local tool activation first; this supports touch clients and
+        -- lets the equipped combat LocalScript prepare its server state.
+        pcall(function() tool:Activate() end)
+        local root = self:GetRoot()
+        local click = tool:FindFirstChild("LeftClickRemote")
+        if click and click:IsA("RemoteEvent") and root then
+            local delta = primary.Position - root.Position
+            local direction = delta.Magnitude > 0 and delta.Unit or Vector3.zero
+            pcall(function() click:FireServer(direction, 1) end)
+        end
+
+        self.State.lastAttackAt = now
+        self.State.attempts = self.State.attempts + 1
+        self.State.lastTargetCount = #hitData
+        local ok, reason = pcall(function()
+            attack:FireServer(0)
+            local sender = self:GetSendHitsToServer()
+            if sender then sender(primary, hitData) else hit:FireServer(primary, hitData) end
+        end)
+        self.State.lastReason = ok and ("attacked_" .. tostring(toolType) .. "_targets=" .. tostring(#hitData)) or tostring(reason or "attack_failed")
+        self:Record("auto_combat_attack", "targets=" .. tostring(#hitData) .. "|mobs=" .. tostring(self.State.mobTargets) .. "|players=" .. tostring(self.State.playerTargets) .. "|ok=" .. tostring(ok))
+        return ok, self.State.lastReason
+    end
+
+    function AutoCombat:Step()
+        if not self:IsActive() then
+            self.State.lastReason = "disabled"
+            return false
+        end
+        local ok, reason = self:AttackNearby()
+        if reason and reason ~= "cooldown" and reason ~= "no_target_in_reach" then self.State.lastReason = tostring(reason) end
+        return ok, reason
+    end
+
+    function AutoCombat:Start()
+        if self.State.running then return true end
+        self.State.running = true
+        self.State.generation = (self.State.generation or 0) + 1
+        local generation = self.State.generation
+        task.spawn(function()
+            while self.State.running and self.State.generation == generation do
+                self:Step()
+                task.wait(0.05)
+            end
+        end)
+        return true
+    end
+
+    function AutoCombat:Shutdown()
+        self.State.running = false
+        self.State.generation = (self.State.generation or 0) + 1
+    end
+
+    function AutoCombat:GetSnapshot()
+        local state = self.State
+        return {
+            running = state.running == true,
+            mobsEnabled = self:IsMobEnabled(),
+            playersEnabled = self:IsPlayerEnabled(),
+            attempts = state.attempts or 0,
+            mobTargets = state.mobTargets or 0,
+            playerTargets = state.playerTargets or 0,
+            targetCount = state.lastTargetCount or 0,
+            lastReason = state.lastReason or "",
+        }
+    end
+
+    Flow.Features.AutoCombat = AutoCombat
 end)(Flow)
 
 -- >>> MODULE: features/race_v4.lua
@@ -12171,6 +12450,18 @@ end)(Flow)
             Language.Translations[code][key] = value
         end
     end
+    local combatSettingsLabels = {
+        ["en"] = {combat = "COMBAT", auto_attack_mobs = "Auto Attack Mobs", auto_attack_mobs_desc = "attack every nearby NPC with your equipped Fighting Style or Sword", auto_attack_players = "Auto Attack Players", auto_attack_players_desc = "attack every nearby player with your equipped Fighting Style or Sword"},
+        ["pt-BR"] = {combat = "COMBATE", auto_attack_mobs = "Auto Ataque Mobs", auto_attack_mobs_desc = "ataca todo NPC próximo com seu Estilo de Luta ou Espada equipado", auto_attack_players = "Auto Ataque Jogadores", auto_attack_players_desc = "ataca todo jogador próximo com seu Estilo de Luta ou Espada equipado"},
+        ["es"] = {combat = "COMBATE", auto_attack_mobs = "Auto Ataque Mobs", auto_attack_mobs_desc = "ataca a cada NPC cercano con tu Estilo de Lucha o Espada equipada", auto_attack_players = "Auto Ataque Jugadores", auto_attack_players_desc = "ataca a cada jugador cercano con tu Estilo de Lucha o Espada equipada"},
+        ["vi"] = {combat = "CHIẾN ĐẤU", auto_attack_mobs = "Tự Động Đánh Quái", auto_attack_mobs_desc = "đánh mọi NPC gần bằng Võ Thuật hoặc Kiếm đang cầm", auto_attack_players = "Tự Động Đánh Người Chơi", auto_attack_players_desc = "đánh mọi người chơi gần bằng Võ Thuật hoặc Kiếm đang cầm"},
+    }
+    for code, entries in pairs(combatSettingsLabels) do
+        for key, value in pairs(entries) do
+            Language.Translations[code][key] = value
+        end
+    end
+
     local toggleLabels = {
         ["en"] = {location_teleport_desc = "turn on to travel; turn off during travel to stop"},
         ["pt-BR"] = {location_teleport_desc = "ligue para viajar; desligue durante a viagem para parar"},
@@ -12399,6 +12690,7 @@ end)(Flow)
     local ServerStatus = Flow.Features.ServerStatus
     local Misc = Flow.Features.Misc
     local Farm = Flow.Features.Farm
+    local AutoCombat = Flow.Features.AutoCombat
     local RaidMonitor = Flow.Features.RaidMonitor
     local Raid = Flow.Features.Raid
     local input = Flow.Services.UserInputService
@@ -13951,6 +14243,7 @@ refreshFarmUI()
         sectionHeader(settingsPage, t("settings"), "")
         local styleTab = subButton(settingsPage, t("style"), 0, 78)
         local languageTab = subButton(settingsPage, t("language"), 84, 92)
+        Flow.Runtime.combatTab = subButton(settingsPage, t("combat"), 182, 92)
         local stylePage = Theme.New("Frame", {
             Size = UDim2.new(1, 0, 1, -70),
             Position = UDim2.new(0, 0, 0, 70),
@@ -13958,6 +14251,13 @@ refreshFarmUI()
             Parent = settingsPage,
         })
         local languagePage = Theme.New("Frame", {
+            Size = UDim2.new(1, 0, 1, -70),
+            Position = UDim2.new(0, 0, 0, 70),
+            BackgroundTransparency = 1,
+            Visible = false,
+            Parent = settingsPage,
+        })
+        Flow.Runtime.combatPage = Theme.New("Frame", {
             Size = UDim2.new(1, 0, 1, -70),
             Position = UDim2.new(0, 0, 0, 70),
             BackgroundTransparency = 1,
@@ -14850,6 +15150,44 @@ refreshFarmUI()
         stylePadding.PaddingBottom = UDim.new(0, 6)
         stylePadding.Parent = styleList
 
+        -- Keep these construction-only locals scoped: this large UI factory is
+        -- deliberately close to Luau's local-register ceiling on mobile builds.
+        do
+            local combatList = Theme.New("ScrollingFrame", {
+                Size = UDim2.new(1, 0, 1, 0),
+                BackgroundTransparency = 1,
+                BorderSizePixel = 0,
+                ScrollBarThickness = 4,
+                ScrollBarImageColor3 = Theme.accent,
+                AutomaticCanvasSize = Enum.AutomaticSize.Y,
+                CanvasSize = UDim2.new(),
+                Parent = Flow.Runtime.combatPage,
+            })
+            local combatLayout = Instance.new("UIListLayout")
+            combatLayout.Padding = UDim.new(0, 6)
+            combatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+            combatLayout.Parent = combatList
+            local combatPadding = Instance.new("UIPadding")
+            combatPadding.PaddingRight = UDim.new(0, 5)
+            combatPadding.PaddingBottom = UDim.new(0, 6)
+            combatPadding.Parent = combatList
+
+            local _, mobsToggle = Theme.OptionRow(combatList, t("auto_attack_mobs"), t("auto_attack_mobs_desc"), function(active)
+                State.autoCombatMobs = active
+                if AutoCombat and AutoCombat.Start then AutoCombat:Start() end
+                Config:Save()
+                setStatus(active and t("active") or t("idle"), active and Theme.success or Theme.muted)
+            end, lucide.mobs or lucide.swords)
+            Flow.Runtime.autoCombatMobsToggle = mobsToggle
+            local _, playersToggle = Theme.OptionRow(combatList, t("auto_attack_players"), t("auto_attack_players_desc"), function(active)
+                State.autoCombatPlayers = active
+                if AutoCombat and AutoCombat.Start then AutoCombat:Start() end
+                Config:Save()
+                setStatus(active and t("active") or t("idle"), active and Theme.success or Theme.muted)
+            end, lucide.players or lucide.swords)
+            Flow.Runtime.autoCombatPlayersToggle = playersToggle
+        end
+
         local hubSizeControls
         do
             local Notification = Flow.Features and Flow.Features.Notifications
@@ -15309,6 +15647,8 @@ refreshFarmUI()
         local function syncConfig()
             worldPortalToggle:Set(State.useWorldPortals, true)
             portalToggle:Set(State.usePortal, true)
+            if Flow.Runtime.autoCombatMobsToggle then Flow.Runtime.autoCombatMobsToggle:Set(State.autoCombatMobs ~= false, true) end
+            if Flow.Runtime.autoCombatPlayersToggle then Flow.Runtime.autoCombatPlayersToggle:Set(State.autoCombatPlayers ~= false, true) end
             if farmControls then
                 farmControls.toggle:Set(State.farmLevelEnabled, true)
                 farmControls.autoAttackToggle:Set(State.farmAutoAttack, true)
@@ -15352,10 +15692,14 @@ refreshFarmUI()
 
         local function setSettingsTab(name)
             local style = name == "style"
+            local language = name == "language"
+            local combat = name == "combat"
             stylePage.Visible = style
-            languagePage.Visible = not style
+            languagePage.Visible = language
+            Flow.Runtime.combatPage.Visible = combat
             styleTab.BackgroundColor3 = style and Theme.accent or Theme.panel3
-            languageTab.BackgroundColor3 = style and Theme.panel3 or Theme.accent
+            languageTab.BackgroundColor3 = language and Theme.accent or Theme.panel3
+            Flow.Runtime.combatTab.BackgroundColor3 = combat and Theme.accent or Theme.panel3
         end
 
         local function setCategory(name)
@@ -15415,6 +15759,7 @@ refreshFarmUI()
         Flow:Track(serversTab.MouseButton1Click:Connect(function() setTravelTab("servers") end))
         Flow:Track(styleTab.MouseButton1Click:Connect(function() setSettingsTab("style") end))
         Flow:Track(languageTab.MouseButton1Click:Connect(function() setSettingsTab("language") end))
+        Flow:Track(Flow.Runtime.combatTab.MouseButton1Click:Connect(function() setSettingsTab("combat") end))
         Flow:Track(refresh.MouseButton1Click:Connect(function()
             renderFruitPage()
             setStatus(t("ok"), Theme.success)
@@ -15568,6 +15913,11 @@ end)(Flow)
     if priority and priority.Start then pcall(function() priority:Start() end) end
     local telemetry = Flow.Features.SystemTelemetry
     if Flow.State.telemetryEnabled and telemetry and telemetry.Start then pcall(function() telemetry:Start() end) end
+    -- Settings → Combat is an independent nearby-target controller. It starts
+    -- once per Hub instance and simply stays idle whenever both saved toggles
+    -- are off or no eligible equipped Melee/Sword is present.
+    local autoCombat = Flow.Features.AutoCombat
+    if autoCombat and autoCombat.Start then pcall(function() autoCombat:Start() end) end
     local gui, reason = Flow.UI:Create()
     if not gui then
         error(Flow.Language:T("ui_start_failed", tostring(reason)))
