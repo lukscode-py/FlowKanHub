@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.47"
+    Flow.Version = "1.14.52"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -162,10 +162,14 @@ end)(Flow)
         -- migration from ever replacing a saved personal choice.
         teleportSpeedExplicit = false,
         travelSpeedRevision = 2,
-        -- Direct travel guards. Water protection is on by default; the
-        -- obstacle guard escalates height only after a real wall/reroute signal.
-        antiWaterEnabled = true,
-        antiImpassableEnabled = true,
+        -- Optional route assists start off. They are available in Teleport for
+        -- a player who actually needs a water/geometry detour, but Farm should
+        -- not elevate around normal local combat by default.
+        antiWaterEnabled = false,
+        antiImpassableEnabled = false,
+        antiWaterExplicit = false,
+        antiImpassableExplicit = false,
+        travelSafetyDefaultRevision = 2,
         usePortal = true,
         -- Native map portals are enabled only after this profile has positive
         -- inventory evidence or a successful physical portal test.
@@ -328,6 +332,17 @@ end)(Flow)
         state.travelSpeedRevision = 2
         if type(data.antiWaterEnabled) == "boolean" then state.antiWaterEnabled = data.antiWaterEnabled end
         if type(data.antiImpassableEnabled) == "boolean" then state.antiImpassableEnabled = data.antiImpassableEnabled end
+        if type(data.antiWaterExplicit) == "boolean" then state.antiWaterExplicit = data.antiWaterExplicit end
+        if type(data.antiImpassableExplicit) == "boolean" then state.antiImpassableExplicit = data.antiImpassableExplicit end
+        -- Revision 2 changes the shipped travel-assist default to off. A new
+        -- explicit marker means later releases never override a player's own
+        -- selection; unmarked old defaults migrate once to the safer local
+        -- combat behavior requested for Farm.
+        if (tonumber(data.travelSafetyDefaultRevision) or 0) < 2 then
+            if state.antiWaterExplicit ~= true then state.antiWaterEnabled = false end
+            if state.antiImpassableExplicit ~= true then state.antiImpassableEnabled = false end
+        end
+        state.travelSafetyDefaultRevision = 2
         if type(data.usePortal) == "boolean" then state.usePortal = data.usePortal end
         if type(data.useWorldPortals) == "boolean" then state.useWorldPortals = data.useWorldPortals end
         if type(data.worldPortalStatus) == "table" then state.worldPortalStatus = copy(data.worldPortalStatus) end
@@ -443,6 +458,9 @@ end)(Flow)
             travelSpeedRevision = state.travelSpeedRevision,
             antiWaterEnabled = state.antiWaterEnabled,
             antiImpassableEnabled = state.antiImpassableEnabled,
+            antiWaterExplicit = state.antiWaterExplicit == true,
+            antiImpassableExplicit = state.antiImpassableExplicit == true,
+            travelSafetyDefaultRevision = state.travelSafetyDefaultRevision,
             usePortal = state.usePortal,
             useWorldPortals = state.useWorldPortals,
             worldPortalStatus = copy(state.worldPortalStatus),
@@ -2158,6 +2176,300 @@ end)(Flow)
     Flow.Features.Portal = Portal
 end)(Flow)
 
+-- >>> MODULE: features/travel/travel_submerged_exit.lua
+;(function(Flow)
+    local SubmergedExit = {}
+    local workspace = Flow.Services.Workspace
+    local player = Flow.Player
+    local virtualInput = Flow.Services.VirtualInputManager
+    local teleport = Flow.Features.Teleport
+    local portal = Flow.Features.Portal
+
+    SubmergedExit.EntryPosition = Vector3.new(11520.8, -2154.5, 9829.5)
+    SubmergedExit.Radius = 4500
+    -- Captured at the exact user click that opened the Submarine Worker dialog.
+    -- It is used only to bring the client into streaming range when the Worker
+    -- model has not yet replicated; live Worker geometry still takes priority.
+    SubmergedExit.WorkerFallbackPosition = Vector3.new(11430.0, -2154.5, 9732.0)
+    SubmergedExit.WorkerRange = 12
+    SubmergedExit.NativeArrivalDistance = 500
+    SubmergedExit.DialogueTimeout = 3.5
+    SubmergedExit.GatewayTimeout = 4.5
+    SubmergedExit.ArrivalTimeout = 8
+    SubmergedExit.State = {
+        attempts = 0,
+        nativeSuccesses = 0,
+        fallbackSuccesses = 0,
+        lastMode = "idle",
+        lastReason = "",
+        lastDestination = "",
+        lastAt = 0,
+    }
+
+    local function rootOf(character)
+        return character and (character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart) or nil
+    end
+
+    local function waitFor(seconds, predicate)
+        local deadline = os.clock() + math.max(0, tonumber(seconds) or 0)
+        repeat
+            local ok, value = pcall(predicate)
+            if ok and value then return value end
+            task.wait(0.05)
+        until os.clock() >= deadline
+        local ok, value = pcall(predicate)
+        return ok and value or nil
+    end
+
+    local function visibleTree(object, playerGui)
+        local current = object
+        while current and current ~= playerGui do
+            if current:IsA("GuiObject") and current.Visible == false then return false end
+            if current:IsA("ScreenGui") and current.Enabled == false then return false end
+            current = current.Parent
+        end
+        return current == playerGui
+    end
+
+    function SubmergedExit:Record(kind, detail)
+        local telemetry = Flow.Features and Flow.Features.SystemTelemetry
+        if telemetry and telemetry.Record then
+            pcall(function()
+                telemetry:Record(kind, "submarine_exit|" .. tostring(detail or ""))
+            end)
+        end
+    end
+
+    function SubmergedExit:SetResult(mode, reason, destination)
+        self.State.lastMode = mode or "idle"
+        self.State.lastReason = tostring(reason or "")
+        self.State.lastDestination = tostring(destination and (destination.name or destination.key) or "")
+        self.State.lastAt = os.clock()
+    end
+
+    function SubmergedExit:GetSnapshot()
+        return {
+            attempts = self.State.attempts,
+            nativeSuccesses = self.State.nativeSuccesses,
+            fallbackSuccesses = self.State.fallbackSuccesses,
+            lastMode = self.State.lastMode,
+            lastReason = self.State.lastReason,
+            lastDestination = self.State.lastDestination,
+            lastAt = self.State.lastAt,
+        }
+    end
+
+    function SubmergedExit:GetRoot()
+        return rootOf(player and player.Character)
+    end
+
+    function SubmergedExit:IsOnSubmergedIsland()
+        local farm = Flow.Features and Flow.Features.Farm
+        if farm and type(farm.IsOnSubmergedIsland) == "function" then
+            local ok, result = pcall(function() return farm:IsOnSubmergedIsland() end)
+            if ok then return result == true end
+        end
+        local root = self:GetRoot()
+        return root and (root.Position - self.EntryPosition).Magnitude <= self.Radius or false
+    end
+
+    function SubmergedExit:GetWorker()
+        local npcs = workspace and workspace:FindFirstChild("NPCs")
+        local worker = npcs and npcs:FindFirstChild("Submarine Worker")
+        return worker and worker:IsA("Model") and worker or nil
+    end
+
+    function SubmergedExit:GetWorkerPosition(worker)
+        worker = worker or self:GetWorker()
+        if not worker then return self.WorkerFallbackPosition end
+        local ok, pivot = pcall(function() return worker:GetPivot() end)
+        if ok and pivot then return pivot.Position end
+        local part = worker:FindFirstChildWhichIsA("BasePart", true)
+        return part and part.Position or self.WorkerFallbackPosition
+    end
+
+    function SubmergedExit:MoveToWorker(worker)
+        local root = self:GetRoot()
+        local position = self:GetWorkerPosition(worker)
+        if not root or not position then return false, "submarine_worker_unavailable" end
+        if (root.Position - position).Magnitude <= self.WorkerRange then return true, "worker_nearby" end
+        -- This is a short, local approach inside the same underground island.
+        -- Do not open Portal Fruit or a map portal while approaching the NPC.
+        return teleport:TravelDirectToPosition(position, "submarine_exit", "Submarine Worker", {
+            ignoreNoSupportWater = true,
+            disableAdaptiveClearance = true,
+            holdArrivalVelocity = true,
+            maxAttempts = 1,
+        })
+    end
+
+    function SubmergedExit:OpenWorkerDialogue(worker)
+        local prompt = worker and worker:FindFirstChildWhichIsA("ProximityPrompt", true)
+        local usePrompt = Flow:GetExecutorFunction("fireproximityprompt")
+        if prompt and usePrompt then
+            local ok = pcall(function() usePrompt(prompt) end)
+            if ok then return true, "proximity_prompt" end
+        end
+
+        local detector = worker and worker:FindFirstChildWhichIsA("ClickDetector", true)
+        local useDetector = Flow:GetExecutorFunction("fireclickdetector")
+        if detector and useDetector then
+            local ok = pcall(function() useDetector(detector) end)
+            if ok then return true, "click_detector" end
+        end
+
+        -- Compatibility fallback for executors without the two helpers. This is
+        -- the same normal mouse path captured from the verified user action;
+        -- it does not call a game Remote or fabricate dialogue data.
+        local camera = workspace and workspace.CurrentCamera
+        local part = worker and worker:FindFirstChildWhichIsA("BasePart", true)
+        if virtualInput and camera and part then
+            local point, onScreen = camera:WorldToViewportPoint(part.Position)
+            if onScreen then
+                local ok = pcall(function()
+                    virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 1)
+                    virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 1)
+                end)
+                if ok then return true, "screen_click" end
+            end
+        end
+        return false, "submarine_interaction_unavailable"
+    end
+
+    function SubmergedExit:GetTravelOptionButton()
+        local gui = player and player:FindFirstChildOfClass("PlayerGui")
+        local dialogue = gui and gui:FindFirstChild("DialogueGui")
+        if not gui or not dialogue or not visibleTree(dialogue, gui) then return nil end
+
+        -- In the verified Worker dialogue option1 is the visible "Travel"
+        -- choice and option2 is "Nevermind". The rendered text is built from
+        -- nested glyph objects, so the stable option index is used rather than
+        -- guessing from transient child label text.
+        for _, object in ipairs(dialogue:GetDescendants()) do
+            if object:IsA("GuiObject") and string.find(string.lower(object.Name or ""), "option1", 1, true) then
+                local button = object:FindFirstChildWhichIsA("TextButton", true)
+                if button and visibleTree(button, gui) then return button end
+            end
+        end
+        return nil
+    end
+
+    function SubmergedExit:ClickButton(button)
+        local gui = player and player:FindFirstChildOfClass("PlayerGui")
+        if not button or not gui or not visibleTree(button, gui) then return false, "submarine_button_unavailable" end
+
+        if virtualInput then
+            local position, size = button.AbsolutePosition, button.AbsoluteSize
+            if size.X > 1 and size.Y > 1 then
+                local clicked = pcall(function()
+                    virtualInput:SendMouseButtonEvent(position.X + size.X / 2, position.Y + size.Y / 2, 0, true, game, 1)
+                    virtualInput:SendMouseButtonEvent(position.X + size.X / 2, position.Y + size.Y / 2, 0, false, game, 1)
+                end)
+                if clicked then return true, "mouse" end
+            end
+        end
+
+        local activated = pcall(function() button:Activate() end)
+        if activated then return true, "activate" end
+
+        local firesignal = Flow.Executor and Flow.Executor.firesignal
+        if firesignal then
+            local signaled = pcall(function() firesignal(button.MouseButton1Click) end)
+            if signaled then return true, "signal" end
+        end
+        return false, "submarine_button_click_failed"
+    end
+
+    function SubmergedExit:OpenNativeGateway()
+        local alreadyOpen = portal and portal:GatewayInfo()
+        if alreadyOpen then return true, "gateway_already_open" end
+
+        -- The Worker can be outside the current streaming radius even though
+        -- the player is already in Submerged Island. First use the recorded
+        -- interaction point, then require the actual replicated Worker before
+        -- pressing any normal game interaction surface.
+        local worker = self:GetWorker()
+        local moved, moveReason = self:MoveToWorker(worker)
+        if not moved then return false, moveReason or "submarine_worker_move_failed" end
+        worker = waitFor(3, function() return self:GetWorker() end)
+        if not worker then return false, "submarine_worker_not_streamed" end
+
+        local opened, openReason = self:OpenWorkerDialogue(worker)
+        if not opened then return false, openReason end
+        local option = waitFor(self.DialogueTimeout, function() return self:GetTravelOptionButton() end)
+        if not option then return false, "submarine_travel_option_unavailable" end
+        local clicked, clickReason = self:ClickButton(option)
+        if not clicked then return false, clickReason end
+
+        local gateway = waitFor(self.GatewayTimeout, function()
+            local ready = portal and portal:GatewayInfo()
+            return ready == true
+        end)
+        return gateway == true, gateway and "gateway_open" or "submarine_gateway_timeout"
+    end
+
+    function SubmergedExit:UseNativeExit(destination)
+        if not destination or not destination.position or not destination.key then return false, "location_missing" end
+        if not portal or type(portal.ClickIsland) ~= "function" then return false, "gateway_controller_unavailable" end
+
+        local opened, openReason = self:OpenNativeGateway()
+        if not opened then return false, openReason end
+
+        local root = self:GetRoot()
+        if not root then return false, "root_missing" end
+        local before = root.Position
+        local clicked, clickReason = portal:ClickIsland(destination.nativeKey or destination.key)
+        if not clicked then return false, clickReason or "submarine_destination_unavailable" end
+
+        local arrived = waitFor(self.ArrivalTimeout, function()
+            local current = self:GetRoot()
+            return current and (current.Position - before).Magnitude >= self.NativeArrivalDistance
+        end)
+        if not arrived then return false, "submarine_arrival_timeout" end
+        teleport:WaitForRootStable(0.35)
+        return true, "native_submarine"
+    end
+
+    function SubmergedExit:Travel(destination)
+        if not destination or not destination.position then return false, "location_missing" end
+        self.State.attempts = self.State.attempts + 1
+        self:Record("submarine_exit_begin", "destination=" .. tostring(destination.name or destination.key))
+
+        local used, nativeReason = self:UseNativeExit(destination)
+        if used then
+            self.State.nativeSuccesses = self.State.nativeSuccesses + 1
+            self:SetResult("native_submarine", nativeReason, destination)
+            self:Record("submarine_exit_end", "mode=native|reason=" .. tostring(nativeReason))
+            return true, nativeReason, {mode = "native_submarine", reason = nativeReason, target = destination.name}
+        end
+
+        if nativeReason == "cancelled" or nativeReason == "hub_closed" or nativeReason == "travel_busy" then
+            self:SetResult("cancelled", nativeReason, destination)
+            self:Record("submarine_exit_end", "mode=cancelled|reason=" .. tostring(nativeReason))
+            return false, nativeReason
+        end
+
+        -- The fallback is the same full shared planner used everywhere else:
+        -- Portal Fruit, confirmed map portals, then direct travel. It makes
+        -- every existing location option usable even if a game update hides a
+        -- native submarine destination or changes an interaction component.
+        self:Record("submarine_exit_fallback", "reason=" .. tostring(nativeReason))
+        local moved, reason, plan = teleport:TravelToPosition(
+            destination.position,
+            "location",
+            destination.name,
+            Flow.Features.Portal,
+            Flow.Features.WorldPortals
+        )
+        if moved then self.State.fallbackSuccesses = self.State.fallbackSuccesses + 1 end
+        self:SetResult(moved and "planner_fallback" or "failed", moved and reason or (nativeReason .. " -> " .. tostring(reason)), destination)
+        self:Record("submarine_exit_end", "mode=" .. tostring(moved and "fallback" or "failed") .. "|native=" .. tostring(nativeReason) .. "|reason=" .. tostring(reason))
+        return moved, reason, plan
+    end
+
+    Flow.Features.SubmergedExit = SubmergedExit
+end)(Flow)
+
 -- >>> MODULE: features/travel/travel_native_portals.lua
 ;(function(Flow)
     local WorldPortals = {}
@@ -2774,6 +3086,7 @@ end)(Flow)
                 table.insert(list, {
                     id = item.id,
                     name = item.name,
+                    key = item.key,
                     group = item.group,
                     position = position,
                 })
@@ -2811,6 +3124,17 @@ end)(Flow)
     function Locations:Travel(destination)
         destination = destination or self:GetSelected()
         if not destination then return false, "location_missing" end
+
+        -- A selected location becomes a one-press native Submarine Worker exit
+        -- while the player is inside Submerged Island. The worker's own visible
+        -- Gateway handles the current game price (Tiki is free; other entries
+        -- can require Beli). If the native menu changes or lacks an entry, the
+        -- exact same shared Portal/map-portal/direct planner remains available.
+        local submergedExit = Flow.Features.SubmergedExit
+        if submergedExit and submergedExit.IsOnSubmergedIsland and submergedExit:IsOnSubmergedIsland() then
+            return submergedExit:Travel(destination)
+        end
+
         return teleport:TravelToPosition(
             destination.position,
             "location",
@@ -3530,6 +3854,24 @@ end)(Flow)
         consecutiveRejected = 0,
         attackAccepted = 0,
         attackRejected = 0,
+        -- Combat latency is measured from the phase transition through the
+        -- first emitted attack and first observed HP reduction. It is exported
+        -- by passive telemetry, not shown as technical UI jargon.
+        combatStartedAt = 0,
+        firstAttackAt = 0,
+        firstDamageAt = 0,
+        combatTarget = nil,
+        attackAttempts = 0,
+        lastAttackReason = "",
+        weaponEquipTransitions = 0,
+        weaponEquipRequestedAt = 0,
+        weaponReadyAt = 0,
+        combatPrewarmRunning = false,
+        combatPrewarmAt = 0,
+        combatPrewarmSeconds = 0,
+        attackPulseRunning = false,
+        attackPulseId = 0,
+        nextAttackAt = 0,
         lastQuestProgress = "",
         orbitSeconds = 0,
     }
@@ -3830,10 +4172,23 @@ end)(Flow)
     end
 
     function Farm:SetPhase(phase, detail, quest, target)
-        self.State.phase = phase or "idle"
-        self.State.detail = detail or ""
-        self.State.quest = quest
-        self.State.target = target
+        local state = self.State
+        local nextPhase = phase or "idle"
+        local enteringCombat = nextPhase == "combat" and (state.phase ~= "combat" or state.combatTarget ~= target)
+        if enteringCombat then
+            state.combatStartedAt = os.clock()
+            state.firstAttackAt = 0
+            state.firstDamageAt = 0
+            state.combatTarget = target
+            state.nextAttackAt = 0
+        elseif nextPhase ~= "combat" and state.phase == "combat" then
+            state.combatTarget = nil
+            self:StopAttackPulse()
+        end
+        state.phase = nextPhase
+        state.detail = detail or ""
+        state.quest = quest
+        state.target = target
     end
 
     function Farm:GetSnapshot()
@@ -3856,6 +4211,14 @@ end)(Flow)
             hoverCorrections = state.hoverCorrections or 0,
             hoverVerticalCorrections = state.hoverVerticalCorrections or 0,
             hoverDriftY = state.hoverLastDriftY or 0,
+            combatStartedAt = state.combatStartedAt or 0,
+            firstAttackAt = state.firstAttackAt or 0,
+            firstDamageAt = state.firstDamageAt or 0,
+            attackAttempts = state.attackAttempts or 0,
+            lastAttackReason = state.lastAttackReason or "",
+            weaponEquipTransitions = state.weaponEquipTransitions or 0,
+            prewarmSeconds = state.combatPrewarmSeconds or 0,
+            attackPulseRunning = state.attackPulseRunning == true,
         }
     end
 
@@ -3918,9 +4281,22 @@ end)(Flow)
         local character = self:GetCharacter()
         local humanoid = self:GetHumanoid()
         if not tool or not character or not humanoid then return nil, "weapon_missing" end
+        local state = self.State
         if tool.Parent ~= character then
+            local now = os.clock()
             local ok = pcall(function() humanoid:EquipTool(tool) end)
             if not ok then return nil, "weapon_equip_failed" end
+            state.weaponEquipTransitions = (state.weaponEquipTransitions or 0) + 1
+            state.weaponEquipRequestedAt = now
+            -- EquipTool can be asynchronous on touch clients. Do not emit the
+            -- attack Remote during the same frame unless the Tool has actually
+            -- reached Character; the pulse retries promptly without a fixed
+            -- multi-second wait.
+            if tool.Parent ~= character then return nil, "weapon_equipping" end
+        end
+        if state.weaponEquipRequestedAt and state.weaponEquipRequestedAt > 0 then
+            state.weaponReadyAt = os.clock()
+            state.weaponEquipRequestedAt = 0
         end
         return tool
     end
@@ -4489,6 +4865,9 @@ end)(Flow)
         end
         if accepted then
             self.State.attackAccepted = self.State.attackAccepted + 1
+            if (self.State.combatStartedAt or 0) > 0 and (self.State.firstDamageAt or 0) == 0 then
+                self.State.firstDamageAt = os.clock()
+            end
             self.State.consecutiveRejected = 0
             self.State.singleTargetMode = false
             self.State.adaptiveAttackCooldown = math.max(0.25, (self.State.adaptiveAttackCooldown or 0.25) - 0.01)
@@ -4506,6 +4885,74 @@ end)(Flow)
             end
         end
         self.State.pendingAttack = nil
+    end
+
+    -- Resolve only the Hub's known combat surfaces before a target is in
+    -- range. This moves one-time executor/module work off the first damage
+    -- window without firing a Remote or changing the character.
+    function Farm:PrewarmCombat()
+        local state = self.State
+        if state.combatPrewarmRunning then return end
+        state.combatPrewarmRunning = true
+        state.combatPrewarmAt = os.clock()
+        task.spawn(function()
+            local began = os.clock()
+            pcall(function()
+                self:GetCombatRemotes()
+                if self:HasCombatRemoteThread() then self:GetSendHitsToServer() end
+            end)
+            state.combatPrewarmSeconds = os.clock() - began
+            state.combatPrewarmRunning = false
+        end)
+    end
+
+    function Farm:StopAttackPulse()
+        local state = self.State
+        state.attackPulseId = (state.attackPulseId or 0) + 1
+        state.attackPulseRunning = false
+        state.nextAttackAt = 0
+    end
+
+    -- Quest/cluster planning stays at 0.12 s for mobile friendliness. A
+    -- narrowly-owned pulse schedules only combat attempts by their actual
+    -- cooldown, removing the old 0.25 s -> ~0.36 s loop quantization.
+    function Farm:StartAttackPulse()
+        local state = self.State
+        if state.attackPulseRunning then return end
+        state.attackPulseRunning = true
+        state.attackPulseId = (state.attackPulseId or 0) + 1
+        local pulseId, generation = state.attackPulseId, state.generation
+        task.spawn(function()
+            while State.farmLevelEnabled and state.generation == generation and state.attackPulseId == pulseId and state.phase == "combat" do
+                self:UpdateAttackFeedback()
+                local now = os.clock()
+                local cooldown = math.max(0.25, state.adaptiveAttackCooldown or 0.25)
+                local dueAt = math.max(state.nextAttackAt or 0, (state.lastAttackAt or 0) + cooldown)
+                if now >= dueAt then
+                    local target = state.target
+                    local ok, attacked, reason = pcall(function() return self:Attack(target) end)
+                    if not ok then
+                        state.lastAttackReason = tostring(attacked)
+                        state.nextAttackAt = os.clock() + 0.08
+                    elseif reason == "weapon_equipping" then
+                        state.lastAttackReason = reason
+                        state.nextAttackAt = os.clock() + 0.04
+                    elseif reason == "cooldown" then
+                        state.nextAttackAt = (state.lastAttackAt or os.clock()) + math.max(0.25, state.adaptiveAttackCooldown or 0.25)
+                    else
+                        state.lastAttackReason = tostring(reason or "")
+                        if attacked and reason == "attacked" then
+                            state.nextAttackAt = (state.lastAttackAt or os.clock()) + math.max(0.25, state.adaptiveAttackCooldown or 0.25)
+                        else
+                            state.nextAttackAt = os.clock() + 0.06
+                        end
+                    end
+                else
+                    task.wait(math.max(0.01, math.min(0.05, dueAt - now)))
+                end
+            end
+            if state.attackPulseId == pulseId then state.attackPulseRunning = false end
+        end)
     end
 
     function Farm:GetCombatRemotes()
@@ -4605,6 +5052,10 @@ end)(Flow)
             pcall(function() click:FireServer(direction, 1) end)
         end
         self.State.lastAttackAt = now
+        self.State.attackAttempts = (self.State.attackAttempts or 0) + 1
+        if (self.State.combatStartedAt or 0) > 0 and (self.State.firstAttackAt or 0) == 0 then
+            self.State.firstAttackAt = now
+        end
         local models = {}
         for _, row in ipairs(hitData) do table.insert(models, row[1]) end
         local ok, errorMessage = pcall(function()
@@ -4613,13 +5064,15 @@ end)(Flow)
             if sender then sender(primaryPart, hitData) else hit:FireServer(primaryPart, hitData) end
         end)
         if ok then self.State.pendingAttack = { at = now, health = health, targets = #hitData, models = models } end
-        return ok, ok and "attacked" or tostring(errorMessage or "attack_failed")
+        self.State.lastAttackReason = ok and "attacked" or tostring(errorMessage or "attack_failed")
+        return ok, self.State.lastAttackReason
     end
 
     function Farm:PauseForPriority(reason)
         reason = tostring(reason or "priority")
         if self.State.priorityPauseReason == reason then return true end
         self.State.priorityPauseReason = reason
+        self:StopAttackPulse()
         -- Never clear another owner's Raid/fruit hover; Farm only releases its
         -- own local lease and its own pending movement.
         if self.State.hoverOwner == "farm" then self:ClearHover() end
@@ -4713,8 +5166,9 @@ end)(Flow)
         self:BeginHoverAt(anchor, false)
         self:SetPhase("combat", "combat", quest, target)
         self:BringMobs(target, anchor)
-        local attacked, reason = self:Attack(target)
-        if not attacked and reason ~= "cooldown" and reason ~= "attack_off" then self:SetPhase("combat", reason or "combat", quest, target) end
+        -- Attack owns its own exact cooldown pulse; Step remains responsible
+        -- for target/quest safety and never starts a second concurrent sender.
+        self:StartAttackPulse()
         return true
     end
 
@@ -4753,6 +5207,7 @@ end)(Flow)
         self.State.generation = self.State.generation + 1
         if not enabled then
             self.State.running = false
+            self:StopAttackPulse()
             self:ClearHover()
             self:RestoreGrouped()
             self:ResetCombatAnchor()
@@ -4762,6 +5217,7 @@ end)(Flow)
             return true
         end
         self.State.running = true
+        self:PrewarmCombat()
         self:SetPhase("resolving_quest", "resolving_quest", nil, nil)
         local generation = self.State.generation
         task.spawn(function() self:Run(generation) end)
@@ -4771,6 +5227,7 @@ end)(Flow)
     function Farm:Shutdown()
         self.State.generation = self.State.generation + 1
         self.State.running = false
+        self:StopAttackPulse()
         self:ClearHover()
         self:RestoreGrouped()
         self:ResetCombatAnchor()
@@ -4927,8 +5384,9 @@ end)(Flow)
     Raid.NativeReturnRelocationDistance = 2200
     Raid.WaveAnchorShift = 55
     -- Exact Castle on the Sea position requested for the normal Raid-chip
-    -- summon flow. Auto Raid reaches it only through the existing Teleport
-    -- module's TravelDirectToPosition contract; no duplicate mover exists.
+    -- summon flow. Auto Raid reaches it through the complete shared Teleport
+    -- planner, so Portal Fruit and profile-confirmed map portals are considered
+    -- before a direct fallback; no duplicate mover exists.
     Raid.SummonPosition = Vector3.new(-5045.791, 315.101, -2989.082)
     Raid.SummonAccessRadius = 180
     Raid.InitialIslandAcquireRadius = 2000 -- retained from the extracted script's local-island guard.
@@ -5005,6 +5463,8 @@ end)(Flow)
         chipCooldownBlocked = false,
         chipCooldownBlockedUntil = 0,
         chipRetryAt = 0,
+        summonTravelMode = "",
+        summonTravelReason = "",
         nativeTransferStartedAt = 0,
         nativeTransferConfirmed = false,
         nativeTransferOrigin = nil,
@@ -5545,19 +6005,28 @@ end)(Flow)
         if not root then return false, "root_missing" end
         local distance = (root.Position - self.SummonPosition).Magnitude
         if distance <= self.SummonAccessRadius then return true, "summon_area" end
-        if not teleport or not teleport.TravelDirectToPosition then return false, "movement_unavailable" end
-        -- A Raid direct route owns movement. Release only a Raid-owned lease;
-        -- the shared Teleport module performs cancellation, collision cleanup,
-        -- retry and arrival confirmation.
+        if not teleport or not teleport.TravelToPosition then return false, "movement_unavailable" end
+        -- A Raid route owns movement. Release only a Raid-owned lease; then use
+        -- the same full planner as normal locations/Fruit routes. It can choose
+        -- Portal Fruit, a profile-confirmed native map-portal chain, or direct
+        -- movement according to the player's saved toggles and measured ETA.
         if farm and farm.ClearExternalStage then pcall(function() farm:ClearExternalStage("raid") end) end
         if farm and farm.EndExternalHover then pcall(function() farm:EndExternalHover("raid") end) end
         self:SetPhase("going_to_summon", "castle_on_the_sea|distance=" .. tostring(math.floor(distance + 0.5)))
-        local moved, reason = teleport:TravelDirectToPosition(self.SummonPosition, "raid", "Raid summon Castle on the Sea")
+        local moved, reason, plan = teleport:TravelToPosition(
+            self.SummonPosition,
+            "raid",
+            "Raid summon Castle on the Sea",
+            Flow.Features.Portal,
+            Flow.Features.WorldPortals
+        )
+        self.State.summonTravelMode = tostring(plan and plan.mode or "direct")
+        self.State.summonTravelReason = tostring(reason or "")
         if moved then
-            self:Trace("summon_travel", "arrived|" .. tostring(self.SummonPosition))
+            self:Trace("summon_travel", "arrived|mode=" .. self.State.summonTravelMode .. "|" .. tostring(self.SummonPosition))
             return true, "summon_arrived"
         end
-        self:Trace("summon_travel", "failed|" .. tostring(reason))
+        self:Trace("summon_travel", "failed|mode=" .. self.State.summonTravelMode .. "|" .. tostring(reason))
         return false, reason or "summon_travel_failed"
     end
 
@@ -7144,6 +7613,8 @@ end)(Flow)
             selectedFruit = self.State.selectedFruit,
             chipResponse = self.State.lastChipResponse or "",
             chipDecision = self.State.lastChipDecision or "",
+            summonTravelMode = self.State.summonTravelMode or "",
+            summonTravelReason = self.State.summonTravelReason or "",
             waveSeen = self.State.waveSeen == true,
             activeWaveSeen = self.State.activeWaveSeen == true,
             waitingAtNextIsland = self.State.waitingAtNextIsland == true,
@@ -8109,6 +8580,14 @@ end)(Flow)
                 hoverCorrections = farm.State.hoverCorrections or 0,
                 hoverVerticalCorrections = farm.State.hoverVerticalCorrections or 0,
                 hoverDriftY = round(farm.State.hoverLastDriftY),
+                combatStartedAt = round(farm.State.combatStartedAt),
+                firstAttackAt = round(farm.State.firstAttackAt),
+                firstDamageAt = round(farm.State.firstDamageAt),
+                attackAttempts = farm.State.attackAttempts or 0,
+                lastAttackReason = farm.State.lastAttackReason,
+                weaponEquipTransitions = farm.State.weaponEquipTransitions or 0,
+                prewarmSeconds = round(farm.State.combatPrewarmSeconds),
+                attackPulse = farm.State.attackPulseRunning == true,
                 priorityPause = farm.State.priorityPauseReason,
             } or nil,
             fruit = finder and finder.State and { running = finder.State.running == true, target = finder.State.target and finder.State.target.name } or nil,
@@ -8125,7 +8604,7 @@ end)(Flow)
         return table.concat({
             tostring(p.health), tostring(p.humanoidState), tostring(pos.x), tostring(pos.y), tostring(pos.z), tostring(velocity.y), tostring(p.islandRaiding),
             tostring(r.running), tostring(r.world), tostring(r.phase), tostring(r.detail), tostring(r.island), tostring(r.target), tostring(r.targetHealth), tostring(r.combatActive), tostring(r.fastCycles), tostring(r.hits),
-            tostring(f.hoverOwner), tostring(f.hoverCorrections), tostring(f.hoverVerticalCorrections), tostring(f.hoverDriftY), tostring(f.priorityPause), tostring(t.owner), tostring(t.target and t.target.x), tostring(t.target and t.target.y), tostring(t.target and t.target.z),
+            tostring(f.hoverOwner), tostring(f.hoverCorrections), tostring(f.hoverVerticalCorrections), tostring(f.hoverDriftY), tostring(f.combatStartedAt), tostring(f.firstAttackAt), tostring(f.firstDamageAt), tostring(f.attackAttempts), tostring(f.lastAttackReason), tostring(f.weaponEquipTransitions), tostring(f.prewarmSeconds), tostring(f.attackPulse), tostring(f.priorityPause), tostring(t.owner), tostring(t.target and t.target.x), tostring(t.target and t.target.y), tostring(t.target and t.target.z),
             tostring(snapshot.enemies), tostring(snapshot.priority and snapshot.priority.winner),
         }, "|")
     end
@@ -13767,11 +14246,13 @@ refreshFarmUI()
         local _, speedInput = optionInput(islandsList, t("travel_speed"), t("travel_speed_desc"), State.teleportSpeed, lucide.speed)
         Flow.Runtime.antiWaterToggle = select(2, Theme.OptionRow(islandsList, t("anti_water"), t("anti_water_desc"), function(active)
             State.antiWaterEnabled = active
+            State.antiWaterExplicit = true
             Config:Save()
             setStatus(t("saved"), Theme.success)
         end, lucide.travel))
         Flow.Runtime.antiImpassableToggle = select(2, Theme.OptionRow(islandsList, t("anti_impassable"), t("anti_impassable_desc"), function(active)
             State.antiImpassableEnabled = active
+            State.antiImpassableExplicit = true
             Config:Save()
             setStatus(t("saved"), Theme.success)
         end, lucide.travel))
