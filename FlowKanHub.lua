@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.46"
+    Flow.Version = "1.14.47"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -972,6 +972,9 @@ end)(Flow)
         if not ticket or type(options) ~= "table" then return end
         ticket.ignoreNoSupportWater = options.ignoreNoSupportWater == true
         ticket.disableAdaptiveClearance = options.disableAdaptiveClearance == true
+        -- Keeps gravity from accumulating during the post-route server-arrival
+        -- observation. It never writes CFrame or blocks reconciliation.
+        ticket.holdArrivalVelocity = options.holdArrivalVelocity == true
         if type(options.maxAttempts) == "number" then
             ticket.maxAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(options.maxAttempts)))
         end
@@ -1447,7 +1450,18 @@ end)(Flow)
                 -- server actually accepted the endpoint.
                 self:StopMotionStabilizer(ticket)
                 self:RestoreCharacter(ticket)
+                -- Farm local approaches can end in open Submerged space. The
+                -- old unforced 1.2 s arrival check let gravity pull the player
+                -- down after a safe elevated segment but before the next Farm
+                -- decision. Hold velocity only (never position/CFrame) during
+                -- that observation, so server reconciliation remains visible.
+                local holdArrival = ticket and ticket.holdArrivalVelocity == true
+                if holdArrival then
+                    ticket.inMotion = true
+                    self:StartMotionStabilizer(ticket)
+                end
                 local confirmed, arrivalReason = self:ConfirmArrival(position, ticket)
+                if holdArrival then self:StopMotionStabilizer(ticket) end
                 if confirmed then
                     self.Metrics.confirmed = self.Metrics.confirmed + 1
                     self.Metrics.lastSeconds = os.clock() - began
@@ -4300,6 +4314,10 @@ end)(Flow)
             return teleport:TravelDirectToPosition(destination, "farm", label, {
                 ignoreNoSupportWater = true,
                 disableAdaptiveClearance = true,
+                -- The server arrival check is read-only but can last 1.2 s.
+                -- Keep velocity neutral during it so a safe route never turns
+                -- into a visible gravity fall before Farm re-reads its anchor.
+                holdArrivalVelocity = true,
                 maxAttempts = 1,
             })
         end
