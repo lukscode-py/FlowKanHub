@@ -2220,6 +2220,9 @@ end)(Flow)
     -- model has not yet replicated; live Worker geometry still takes priority.
     SubmergedExit.WorkerFallbackPosition = Vector3.new(11430.0, -2154.5, 9732.0)
     SubmergedExit.WorkerRange = 12
+    -- Streaming can lag several seconds on mobile after the local approach;
+    -- do not abandon the known Worker route at the old three-second boundary.
+    SubmergedExit.WorkerStreamTimeout = 12
     SubmergedExit.NativeArrivalDistance = 500
     SubmergedExit.DialogueTimeout = 3.5
     SubmergedExit.GatewayTimeout = 4.5
@@ -2419,7 +2422,7 @@ end)(Flow)
         local worker = self:GetWorker()
         local moved, moveReason = self:MoveToWorker(worker)
         if not moved then return false, moveReason or "submarine_worker_move_failed" end
-        worker = waitFor(3, function() return self:GetWorker() end)
+        worker = waitFor(self.WorkerStreamTimeout, function() return self:GetWorker() end)
         if not worker then return false, "submarine_worker_not_streamed" end
 
         local opened, openReason = self:OpenWorkerDialogue(worker)
@@ -2458,40 +2461,68 @@ end)(Flow)
         return true, "native_submarine"
     end
 
+    function SubmergedExit:GetVerifiedTikiExit()
+        -- This is the only exit destination whose complete visible Worker flow
+        -- was confirmed live: Submarine Worker -> Travel -> Tiki Outpost (Free).
+        -- It is intentionally not inferred from a Remote/payload or from the
+        -- requested final destination.
+        local tikiPosition = teleport and teleport.Islands and teleport.Islands["Tiki Outpost"]
+        return {
+            name = "Tiki Outpost",
+            key = "Tiki Outpost",
+            nativeKey = "Tiki Outpost",
+            position = tikiPosition,
+        }
+    end
+
     function SubmergedExit:Travel(destination)
         if not destination or not destination.position then return false, "location_missing" end
         self.State.attempts = self.State.attempts + 1
         self:Record("submarine_exit_begin", "destination=" .. tostring(destination.name or destination.key))
 
-        local used, nativeReason = self:UseNativeExit(destination)
-        if used then
-            self.State.nativeSuccesses = self.State.nativeSuccesses + 1
+        -- Never attempt a world/direct route while the character is still in
+        -- the underwater map. The only verified first leg is the Worker route
+        -- to free Tiki; the ordinary planner may run only after that native
+        -- server relocation is confirmed. This prevents an obstacle/water
+        -- fallback from climbing out of the island into lethal open water.
+        local tiki = self:GetVerifiedTikiExit()
+        if not tiki.position then
+            self:SetResult("failed", "tiki_exit_location_missing", destination)
+            self:Record("submarine_exit_end", "mode=failed|reason=tiki_exit_location_missing")
+            return false, "tiki_exit_location_missing", {mode = "native_submarine_required"}
+        end
+        local used, nativeReason = self:UseNativeExit(tiki)
+        if not used then
+            local mode = (nativeReason == "cancelled" or nativeReason == "hub_closed" or nativeReason == "travel_busy") and "cancelled" or "native_required"
+            self:SetResult(mode, nativeReason, destination)
+            self:Record("submarine_exit_end", "mode=" .. mode .. "|reason=" .. tostring(nativeReason))
+            return false, nativeReason, {mode = "native_submarine_required", reason = nativeReason, target = destination.name}
+        end
+
+        self.State.nativeSuccesses = self.State.nativeSuccesses + 1
+        -- Selecting Tiki itself is complete as soon as its native relocation
+        -- has passed the strict movement/stability confirmation in UseNativeExit.
+        if destination.key == "Tiki Outpost" or destination.name == "Tiki Outpost" then
             self:SetResult("native_submarine", nativeReason, destination)
-            self:Record("submarine_exit_end", "mode=native|reason=" .. tostring(nativeReason))
+            self:Record("submarine_exit_end", "mode=native_tiki|reason=" .. tostring(nativeReason))
             return true, nativeReason, {mode = "native_submarine", reason = nativeReason, target = destination.name}
         end
 
-        if nativeReason == "cancelled" or nativeReason == "hub_closed" or nativeReason == "travel_busy" then
-            self:SetResult("cancelled", nativeReason, destination)
-            self:Record("submarine_exit_end", "mode=cancelled|reason=" .. tostring(nativeReason))
-            return false, nativeReason
-        end
-
-        -- The fallback is the same full shared planner used everywhere else:
-        -- Portal Fruit, confirmed map portals, then direct travel. It makes
-        -- every existing location option usable even if a game update hides a
-        -- native submarine destination or changes an interaction component.
-        self:Record("submarine_exit_fallback", "reason=" .. tostring(nativeReason))
+        -- The final destination is now planned from normal Third Sea space,
+        -- where Portal Fruit, confirmed map portals and direct movement are
+        -- valid again. Raid supplies owner="raid" so the resumed route keeps
+        -- the same movement ownership/cancellation semantics.
+        self:Record("submarine_exit_resume_planner", "via=tiki|destination=" .. tostring(destination.name or destination.key))
         local moved, reason, plan = teleport:TravelToPosition(
             destination.position,
-            "location",
+            destination.owner or "location",
             destination.name,
             Flow.Features.Portal,
             Flow.Features.WorldPortals
         )
         if moved then self.State.fallbackSuccesses = self.State.fallbackSuccesses + 1 end
-        self:SetResult(moved and "planner_fallback" or "failed", moved and reason or (nativeReason .. " -> " .. tostring(reason)), destination)
-        self:Record("submarine_exit_end", "mode=" .. tostring(moved and "fallback" or "failed") .. "|native=" .. tostring(nativeReason) .. "|reason=" .. tostring(reason))
+        self:SetResult(moved and "native_tiki_then_planner" or "failed", moved and reason or (nativeReason .. " -> " .. tostring(reason)), destination)
+        self:Record("submarine_exit_end", "mode=" .. tostring(moved and "tiki_then_planner" or "failed") .. "|native=" .. tostring(nativeReason) .. "|reason=" .. tostring(reason))
         return moved, reason, plan
     end
 
@@ -6292,6 +6323,31 @@ end)(Flow)
         if farm and farm.ClearExternalStage then pcall(function() farm:ClearExternalStage("raid") end) end
         if farm and farm.EndExternalHover then pcall(function() farm:EndExternalHover("raid") end) end
         self:SetPhase("going_to_summon", "castle_on_the_sea|distance=" .. tostring(math.floor(distance + 0.5)))
+
+        -- Raid used to call the world planner directly from Submerged Island.
+        -- That bypassed the captured Worker interaction and could reinterpret
+        -- the underwater ceiling/water as a clearance route. Require the
+        -- verified Worker -> Travel -> free Tiki exit first; only then does
+        -- SubmergedExit resume this same shared planner toward the Castle.
+        local submergedExit = Flow.Features.SubmergedExit
+        if submergedExit and submergedExit.IsOnSubmergedIsland and submergedExit:IsOnSubmergedIsland() then
+            self:SetPhase("leaving_submerged", "submarine_worker_to_tiki")
+            local moved, reason, plan = submergedExit:Travel({
+                name = "Raid summon Castle on the Sea",
+                key = "Sea Castle",
+                position = self.SummonPosition,
+                owner = "raid",
+            })
+            self.State.summonTravelMode = tostring(plan and plan.mode or "native_submarine_required")
+            self.State.summonTravelReason = tostring(reason or "")
+            if moved then
+                self:Trace("summon_travel", "arrived_after_submarine|mode=" .. self.State.summonTravelMode)
+                return true, "summon_arrived"
+            end
+            self:Trace("summon_travel", "submarine_exit_pending_or_failed|mode=" .. self.State.summonTravelMode .. "|" .. tostring(reason))
+            return false, reason or "submarine_exit_required"
+        end
+
         local moved, reason, plan = teleport:TravelToPosition(
             self.SummonPosition,
             "raid",
