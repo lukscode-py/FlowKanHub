@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.45"
+    Flow.Version = "1.14.46"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -963,6 +963,20 @@ end)(Flow)
         return ticket
     end
 
+    -- Internal callers may narrow a route without changing the player-facing
+    -- Teleport safety switches. Farm uses this only for nearby combat
+    -- re-anchors: an underground area can legitimately have no raycast support,
+    -- so that signal must not be mistaken for open water and trigger a tall
+    -- clearance loop after a harmless server correction.
+    function Teleport:ApplyTravelPolicy(ticket, options)
+        if not ticket or type(options) ~= "table" then return end
+        ticket.ignoreNoSupportWater = options.ignoreNoSupportWater == true
+        ticket.disableAdaptiveClearance = options.disableAdaptiveClearance == true
+        if type(options.maxAttempts) == "number" then
+            ticket.maxAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(options.maxAttempts)))
+        end
+    end
+
     function Teleport:IsActive(ticket)
         return ticket ~= nil and self.ActiveTravel == ticket and not ticket.finished and not ticket.cancelled
     end
@@ -1226,6 +1240,13 @@ end)(Flow)
         local distance = (destination - origin).Magnitude
         local hit = self:ProbeDirectPath(origin, destination)
         local waterRisk, waterDetail = self:ProbeWaterRisk(origin, destination)
+        -- In Submerged combat spaces a downward ray may have no streamed map
+        -- support while the player is not crossing water. For a bounded local
+        -- Farm approach this is inconclusive, not proof of water. A real water
+        -- material/name is still protected by Anti Water as usual.
+        if ticket and ticket.ignoreNoSupportWater == true and waterDetail == "no_support" then
+            waterRisk, waterDetail = false, "support_unknown_local"
+        end
         local obstacleGuard = Flow.State.antiImpassableEnabled == true
         local blocked = obstacleGuard and hit ~= nil
         local forced = ticket and ticket.forceClearance == true
@@ -1416,7 +1437,9 @@ end)(Flow)
         local speed = clamp(tonumber(requestedSpeed) or self:GetSpeed(), self.MinSpeed, self.MaxSpeed)
         local lastReason = "movement_failed"
 
-        for attempt = 1, self.MaximumClearanceAttempts do
+        local maximumAttempts = ticket and tonumber(ticket.maxAttempts) or self.MaximumClearanceAttempts
+        maximumAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(maximumAttempts)))
+        for attempt = 1, maximumAttempts do
             if self:IsCancelled(ticket) then break end
             local moved, reason, routeInfo = self:MoveRoute(position, ticket, speed)
             if moved then
@@ -1445,7 +1468,12 @@ end)(Flow)
             -- line was not traversable. Do not jump to a fixed altitude: retry
             -- from the corrected position, adding only one clearance step each
             -- time until a route is accepted or the conservative cap is met.
+            -- A local Farm re-anchor recalculates its live NPC anchor after a
+            -- failed arrival. It must not reinterpret a moving-target/server
+            -- correction as an obstacle and escalate vertically through five
+            -- increasingly high routes.
             local canEscalate = Flow.State.antiImpassableEnabled == true
+                and not (ticket and ticket.disableAdaptiveClearance == true)
             local currentClearance = tonumber(ticket.clearance) or 0
             if canEscalate and currentClearance < self.MaximumClearance then
                 local nextClearance = currentClearance > 0 and currentClearance + self.ClearanceStep or self.InitialClearance
@@ -1477,13 +1505,14 @@ end)(Flow)
     -- Shared executor for every user-requested route: fruit collection and the
     -- Travel → Islands & Locations page use the same plan, safety lock,
     -- cancellation, Portal Fruit, native-map-portal and direct fallback flow.
-    function Teleport:TravelToPosition(position, owner, targetLabel, portal, worldPortals)
+    function Teleport:TravelToPosition(position, owner, targetLabel, portal, worldPortals, options)
         if not position then return false, "destino_invalido" end
         portal = portal or Flow.Features.Portal
         worldPortals = worldPortals or Flow.Features.WorldPortals
 
         local ticket, lockReason = self:BeginTravel(position, owner or "manual")
         if not ticket then return false, lockReason end
+        self:ApplyTravelPolicy(ticket, options)
 
         local moved, reason, plan
         local ok, runtimeError = xpcall(function()
@@ -1555,10 +1584,11 @@ end)(Flow)
     -- confirmation and one-speed-retry contract as normal travel, but never
     -- activates Portal Fruit/Gateway or map portals. Raid islands and summon
     -- pads are short, world-local routes where an ability warp is disruptive.
-    function Teleport:TravelDirectToPosition(position, owner, targetLabel)
+    function Teleport:TravelDirectToPosition(position, owner, targetLabel, options)
         if not position then return false, "destino_invalido" end
         local ticket, lockReason = self:BeginTravel(position, owner or "manual")
         if not ticket then return false, lockReason end
+        self:ApplyTravelPolicy(ticket, options)
 
         local moved, reason
         local ok, runtimeError = xpcall(function()
@@ -3412,6 +3442,10 @@ end)(Flow)
     Farm.HoverHorizontalTolerance = 3
     Farm.HoverVerticalTolerance = 5
     Farm.HoverCorrectionInterval = 0.18
+    -- A nearby combat re-anchor is not a world route. Keep it bounded so a
+    -- moving NPC or an underground support probe cannot send Farm into a tall
+    -- adaptive-clearance loop between mobs.
+    Farm.LocalCombatHorizontalDistance = 650
     -- Confirmed live spawn/cluster anchors for the current Submerged quest.
     -- Generic quests learn anchors from live NPC and EnemySpawns observations.
     Farm.KnownQuestAnchors = {
@@ -4254,10 +4288,25 @@ end)(Flow)
         local destination = targetCFrame.Position
         if (root.Position - destination).Magnitude <= 7 then return true, "arrived" end
         if not teleport or not teleport.TravelToPosition then return false, "movement_unavailable" end
+        local label = tostring(targetLabel or "Farm")
+        local horizontal = Vector3.new(root.Position.X - destination.X, 0, root.Position.Z - destination.Z).Magnitude
+        local localCombatApproach = (label:sub(1, 8) == "cluster:" or label:sub(1, 6) == "spawn:")
+            and horizontal <= self.LocalCombatHorizontalDistance
+        if localCombatApproach and teleport.TravelDirectToPosition then
+            -- Preserve genuine water/wall protection, but do not turn a
+            -- no-support probe or a moving-target correction into a sequence
+            -- of ever-higher routes. The next Farm step will re-read the live
+            -- cluster anchor if this one direct attempt is not accepted.
+            return teleport:TravelDirectToPosition(destination, "farm", label, {
+                ignoreNoSupportWater = true,
+                disableAdaptiveClearance = true,
+                maxAttempts = 1,
+            })
+        end
         return teleport:TravelToPosition(
             destination,
             "farm",
-            targetLabel or "Farm",
+            label,
             Flow.Features.Portal,
             Flow.Features.WorldPortals
         )
