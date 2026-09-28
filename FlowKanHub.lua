@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.43"
+    Flow.Version = "1.14.45"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -155,10 +155,13 @@ end)(Flow)
     local state = shared.FlowKanHub
 
     local defaults = {
-        teleportSpeed = 350,
-        -- Existing profiles receive the verified fast route once; later manual
-        -- values remain the player's own saved preference.
-        travelSpeedRevision = 1,
+        -- Conservative default for touch/mobile replication. A player-set
+        -- speed is preserved per profile and can still be raised in Teleport.
+        teleportSpeed = 140,
+        -- Set only by the Teleport speed input. It prevents a later default
+        -- migration from ever replacing a saved personal choice.
+        teleportSpeedExplicit = false,
+        travelSpeedRevision = 2,
         -- Direct travel guards. Water protection is on by default; the
         -- obstacle guard escalates height only after a real wall/reroute signal.
         antiWaterEnabled = true,
@@ -311,8 +314,18 @@ end)(Flow)
         if type(teleportSpeed) == "number" then
             state.teleportSpeed = math.max(20, math.min(350, teleportSpeed))
         end
-        if (tonumber(data.travelSpeedRevision) or 0) < 1 then state.teleportSpeed = 350 end
-        state.travelSpeedRevision = 1
+        -- New data records an intentional selection separately. Profiles from
+        -- before the marker retain any non-default speed; their old plain 350
+        -- is the only unmarked value that can be recognized as the former
+        -- shipped default and is migrated once.
+        if type(data.teleportSpeedExplicit) == "boolean" then
+            state.teleportSpeedExplicit = data.teleportSpeedExplicit
+        end
+        local speedRevision = tonumber(data.travelSpeedRevision) or 0
+        if speedRevision < 2 and state.teleportSpeed == 350 and state.teleportSpeedExplicit ~= true then
+            state.teleportSpeed = 140
+        end
+        state.travelSpeedRevision = 2
         if type(data.antiWaterEnabled) == "boolean" then state.antiWaterEnabled = data.antiWaterEnabled end
         if type(data.antiImpassableEnabled) == "boolean" then state.antiImpassableEnabled = data.antiImpassableEnabled end
         if type(data.usePortal) == "boolean" then state.usePortal = data.usePortal end
@@ -426,6 +439,7 @@ end)(Flow)
             version = Flow.Version,
             profile = self.ProfileKey,
             teleportSpeed = state.teleportSpeed,
+            teleportSpeedExplicit = state.teleportSpeedExplicit == true,
             travelSpeedRevision = state.travelSpeedRevision,
             antiWaterEnabled = state.antiWaterEnabled,
             antiImpassableEnabled = state.antiImpassableEnabled,
@@ -907,6 +921,9 @@ end)(Flow)
         value = tonumber(value)
         if not value or value < self.MinSpeed or value > self.MaxSpeed then return false end
         Flow.State.teleportSpeed = value
+        -- This flag is serialized with the profile, so a value chosen in the
+        -- UI is never treated as a replaceable shipped default later.
+        Flow.State.teleportSpeedExplicit = true
         return true
     end
 
@@ -3387,6 +3404,14 @@ end)(Flow)
     -- below the verified +30 combat reach, so a stale anchor never leaves an
     -- already-spawned target outside RegisterHit range.
     Farm.CombatAnchorShift = 40
+    -- Hover is deliberately tolerant. Rewriting the character CFrame every
+    -- Heartbeat competes with Android/server replication and creates a visible
+    -- up/down correction loop. The stabilizer holds only vertical gravity;
+    -- CFrame is used for a material combat-anchor displacement, not as a
+    -- per-frame elevator.
+    Farm.HoverHorizontalTolerance = 3
+    Farm.HoverVerticalTolerance = 5
+    Farm.HoverCorrectionInterval = 0.18
     -- Confirmed live spawn/cluster anchors for the current Submerged quest.
     -- Generic quests learn anchors from live NPC and EnemySpawns observations.
     Farm.KnownQuestAnchors = {
@@ -3428,6 +3453,10 @@ end)(Flow)
         hoverOrbitStartedAt = 0,
         hoverOwner = nil,
         hoverActiveCheck = nil,
+        hoverLastCorrectionAt = -math.huge,
+        hoverCorrections = 0,
+        hoverVerticalCorrections = 0,
+        hoverLastDriftY = 0,
         externalStageKey = nil,
         combatAnchor = nil,
         combatAnchorMob = nil,
@@ -3570,14 +3599,14 @@ end)(Flow)
             end
         end
         if not state.hoverLock or not state.hoverLock.Parent then
-            -- The old lock was parented to Head. The Root is the assembly part
-            -- written by movement/hover, so pinning it directly removes the
-            -- one-frame gravity drop that appeared after a failed raid arrival.
+            -- Do not pin X/Z. A three-axis BodyVelocity fights normal player
+            -- and server movement on touch clients. This only offsets gravity
+            -- while the combat point is already established.
             local lock = Instance.new("BodyVelocity")
             lock.Name = "FlowFarmHoverLock"
-            lock.MaxForce = Vector3.new(100000, 100000, 100000)
+            lock.MaxForce = Vector3.new(0, 100000, 0)
             lock.Velocity = Vector3.zero
-            lock.P = 15000
+            lock.P = 6500
             lock.Parent = root
             state.hoverLock = lock
         end
@@ -3614,14 +3643,49 @@ end)(Flow)
         return state.hoverCFrame
     end
 
-    function Farm:ApplyHover()
+    -- `force` is reserved for the instant a new hover lease starts. During
+    -- combat we retain a small vertical/horizontal dead band and never assign
+    -- CFrame on every Heartbeat. This is especially important on Delta Android:
+    -- server reconciliation of a per-frame local Y assignment looks like the
+    -- player repeatedly rising and falling.
+    function Farm:ApplyHover(force)
         local targetCFrame = self:GetHoverCFrame()
         local root = self:GetRoot()
         if not targetCFrame or not root then return false end
         if not self:EnsureHoverStabilizer() then return false end
-        pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+
+        local state = self.State
+        local drift = targetCFrame.Position - root.Position
+        local horizontal = Vector3.new(drift.X, 0, drift.Z).Magnitude
+        local vertical = math.abs(drift.Y)
+        state.hoverLastDriftY = drift.Y
+        local needsCorrection = force == true
+            or horizontal > self.HoverHorizontalTolerance
+            or vertical > self.HoverVerticalTolerance
+        local now = os.clock()
+        if needsCorrection and (force == true or now - (state.hoverLastCorrectionAt or -math.huge) >= self.HoverCorrectionInterval) then
+            -- A reposition is now exceptional: initial placement, a genuine
+            -- anchor movement, or a meaningful drift. It is not a continuous
+            -- vertical teleport while attacking a stationary mob.
+            pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+            pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
+            pcall(function() root.CFrame = targetCFrame end)
+            state.hoverLastCorrectionAt = now
+            state.hoverCorrections = (state.hoverCorrections or 0) + 1
+            if vertical > self.HoverVerticalTolerance then
+                state.hoverVerticalCorrections = (state.hoverVerticalCorrections or 0) + 1
+            end
+            return true
+        end
+
+        -- Keep the gravity axis quiet without cancelling legitimate horizontal
+        -- replication or movement. The BodyVelocity above likewise has no X/Z
+        -- force, avoiding the old physics tug-of-war.
+        pcall(function()
+            local velocity = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+        end)
         pcall(function() root.AssemblyAngularVelocity = Vector3.zero end)
-        pcall(function() root.CFrame = targetCFrame end)
         return true
     end
 
@@ -3644,8 +3708,12 @@ end)(Flow)
         state.hoverControlMode = controlMode
         state.hoverHeightOverride = tonumber(heightOverride)
         state.hoverOrbit = orbit == true
-        if state.hoverOrbit then state.hoverOrbitStartedAt = os.clock() end
-        self:ApplyHover()
+        -- BeginHoverAt is called again by the regular Farm step while combat
+        -- continues. Preserve an existing lease and orbit clock rather than
+        -- turning each 0.12 s step into a forced CFrame placement.
+        local isNewLease = state.hoverConnection == nil
+        if state.hoverOrbit and isNewLease then state.hoverOrbitStartedAt = os.clock() end
+        self:ApplyHover(isNewLease)
         if state.hoverConnection or not runService or not runService.Heartbeat then return true end
         state.hoverConnection = runService.Heartbeat:Connect(function()
             local active = State.farmLevelEnabled
@@ -3697,6 +3765,8 @@ end)(Flow)
         state.hoverOrbit = false
         state.hoverOwner = nil
         state.hoverActiveCheck = nil
+        state.hoverLastCorrectionAt = -math.huge
+        state.hoverLastDriftY = 0
         self:RestoreHoverStabilizer()
     end
 
@@ -3735,6 +3805,9 @@ end)(Flow)
             attackRejected = state.attackRejected or 0,
             cooldown = state.adaptiveAttackCooldown or 0.25,
             orbiting = state.hoverOrbit == true,
+            hoverCorrections = state.hoverCorrections or 0,
+            hoverVerticalCorrections = state.hoverVerticalCorrections or 0,
+            hoverDriftY = state.hoverLastDriftY or 0,
         }
     end
 
@@ -7966,6 +8039,9 @@ end)(Flow)
             farm = farm and farm.State and {
                 running = farm.State.running == true, phase = farm.State.phase, detail = farm.State.detail,
                 hoverOwner = farm.State.hoverOwner, hoverHeight = farm.State.hoverHeightOverride,
+                hoverCorrections = farm.State.hoverCorrections or 0,
+                hoverVerticalCorrections = farm.State.hoverVerticalCorrections or 0,
+                hoverDriftY = round(farm.State.hoverLastDriftY),
                 priorityPause = farm.State.priorityPauseReason,
             } or nil,
             fruit = finder and finder.State and { running = finder.State.running == true, target = finder.State.target and finder.State.target.name } or nil,
@@ -7982,7 +8058,7 @@ end)(Flow)
         return table.concat({
             tostring(p.health), tostring(p.humanoidState), tostring(pos.x), tostring(pos.y), tostring(pos.z), tostring(velocity.y), tostring(p.islandRaiding),
             tostring(r.running), tostring(r.world), tostring(r.phase), tostring(r.detail), tostring(r.island), tostring(r.target), tostring(r.targetHealth), tostring(r.combatActive), tostring(r.fastCycles), tostring(r.hits),
-            tostring(f.hoverOwner), tostring(f.priorityPause), tostring(t.owner), tostring(t.target and t.target.x), tostring(t.target and t.target.y), tostring(t.target and t.target.z),
+            tostring(f.hoverOwner), tostring(f.hoverCorrections), tostring(f.hoverVerticalCorrections), tostring(f.hoverDriftY), tostring(f.priorityPause), tostring(t.owner), tostring(t.target and t.target.x), tostring(t.target and t.target.y), tostring(t.target and t.target.z),
             tostring(snapshot.enemies), tostring(snapshot.priority and snapshot.priority.winner),
         }, "|")
     end
@@ -12170,16 +12246,23 @@ local function renderFarmWeapons()
         end)
     end
 end
-local function refreshFarmUI()
-    local snapshot = Farm and Farm:GetSnapshot() or {}
-    farmToggle:Set(State.farmLevelEnabled, true)
-    -- Covers a late Data.Level replication: Farm stops safely and marks this
-    -- session-only request, then the visible page opens the same explicit modal.
+-- The level cap may be detected after the user has changed pages or after
+-- delayed Data.Level replication. Its decision cannot depend on the Farm page
+-- still being visible: always present the same Cancel / Activate modal globally.
+local function showPendingFarmCapPrompt()
     if State.farmCapPromptPending and maxFarmOverlay and not maxFarmOverlay.Visible then
         State.farmCapPromptPending = false
         farmToggle:Set(false, true)
         maxFarmOverlay.Visible = true
+        return true
     end
+    return false
+end
+
+local function refreshFarmUI()
+    local snapshot = Farm and Farm:GetSnapshot() or {}
+    farmToggle:Set(State.farmLevelEnabled, true)
+    showPendingFarmCapPrompt()
     farmAutoAttackToggle:Set(State.farmAutoAttack, true)
     farmBringToggle:Set(State.farmBringMobs, true)
     farmRadiusInput.Text = tostring(State.farmBringRadius)
@@ -12230,6 +12313,10 @@ Flow:Track(farmSettingsTab.MouseButton1Click:Connect(function() setFarmTab("sett
 task.spawn(function()
     while gui and gui.Parent do
         task.wait(0.25)
+        -- Prompt delivery is global; it must not be lost merely because the
+        -- player navigated away from the Farm tab before delayed level data
+        -- confirmed the cap.
+        showPendingFarmCapPrompt()
         if farmHubPage.Visible then refreshFarmUI() end
     end
 end)
