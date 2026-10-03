@@ -22,7 +22,7 @@ local Flow = {Build = "bundled"}
     if type(shared) == "table" then shared.FlowKanHubInstance = Flow end
 
     Flow.Name = "Flow Kan Hub"
-    Flow.Version = "1.14.54"
+    Flow.Version = "1.14.61"
     Flow.Services = {}
     Flow.Features = {}
     Flow.Runtime = {
@@ -120,6 +120,12 @@ local Flow = {Build = "bundled"}
         if telemetry and telemetry.Shutdown then pcall(function() telemetry:Shutdown() end) end
         local autoCombat = self.Features and self.Features.AutoCombat
         if autoCombat and autoCombat.Shutdown then pcall(function() autoCombat:Shutdown() end) end
+        local boatLocal = self.Features and self.Features.BoatLocal
+        if boatLocal and boatLocal.Shutdown then pcall(function() boatLocal:Shutdown() end) end
+        local esp = self.Features and self.Features.ESP
+        if esp and esp.Shutdown then pcall(function() esp:Shutdown() end) end
+        local eventFarm = self.Features and self.Features.EventFarm
+        if eventFarm and eventFarm.Shutdown then pcall(function() eventFarm:Shutdown() end) end
         local farm = self.Features and self.Features.Farm
         if farm and farm.Shutdown then pcall(function() farm:Shutdown() end) end
         local raid = self.Features and self.Features.Raid
@@ -196,8 +202,64 @@ end)(Flow)
         allFruits = true,
         selectedFruits = {},
         storeFruits = true,
+        -- ESP is a local visual layer. Defaults are intentionally off; each
+        -- source can be enabled independently after the player chooses it.
+        espMasterEnabled = false,
+        -- The default is unlimited. Players can opt into a bounded range in
+        -- Advanced Mode without losing that simple out-of-box behavior.
+        espMaxDistance = 0,
+        espRangeDefaultRevision = 1,
+        espAdvancedMode = false,
+        espTextSize = 13,
+        espTextOutline = true,
+        espFillTransparency = 0.78,
+        espOutlineTransparency = 0.08,
+        espBoxThickness = 1,
+        espBoxTransparency = 0.05,
+        espTracerThickness = 1,
+        espTracerTransparency = 0.15,
+        espTracerOrigin = "bottom",
+        espRefreshInterval = 0.60,
+        espTypes = {
+            fruit = {enabled = false, color = {255, 98, 98}, showName = true, showDistance = true, showHealth = false, highlight = true, box = true, tracer = false},
+            islands = {enabled = false, color = {84, 207, 255}, showName = true, showDistance = true, showHealth = false, highlight = false, box = false, tracer = false},
+            players = {enabled = false, color = {212, 123, 255}, showName = true, showDistance = true, showHealth = true, highlight = true, box = true, tracer = false},
+            bosses = {enabled = false, color = {255, 174, 70}, showName = true, showDistance = true, showHealth = true, highlight = true, box = true, tracer = true},
+            chests = {enabled = false, color = {255, 221, 85}, showName = true, showDistance = true, showHealth = false, highlight = true, box = true, tracer = false},
+            race_v2 = {enabled = false, color = {255, 82, 144}, showName = true, showDistance = true, showHealth = true, highlight = true, box = true, tracer = true},
+            berries = {enabled = false, color = {111, 226, 135}, showName = true, showDistance = true, showHealth = false, highlight = true, box = true, tracer = false},
+            haki = {enabled = false, color = {148, 110, 255}, showName = true, showDistance = true, showHealth = false, highlight = true, box = true, tracer = false},
+            special = {enabled = false, color = {255, 120, 215}, showName = true, showDistance = true, showHealth = true, highlight = true, box = true, tracer = true},
+        },
         antiAfkEnabled = false,
         removeFogEnabled = false,
+        -- Local Boat: all masters start off. Numeric values are only an
+        -- override after their slider is moved; enabling a master alone keeps
+        -- the live game baseline untouched.
+        boatGeneralEnabled = false,
+        boatSpeedOverride = false,
+        boatSpeed = 142.5,
+        boatTorqueOverride = false,
+        boatTorque = 4,
+        boatTurnSpeedOverride = false,
+        boatTurnSpeed = 1,
+        boatFloatEnabled = false,
+        boatFloatHeightOverride = false,
+        boatFloatHeight = 0,
+        boatFloatVerticalRate = 100,
+        boatObstacleEnabled = false,
+        boatObstacleDelay = 1,
+        boatObstacleSpeed = 18,
+        boatObstacleExtra = 80,
+        boatObstacleRise = 220,
+        boatObstacleReturn = 260,
+        -- Sea Events > Farm stores only its selections. The live run itself is
+        -- session-only and always begins off after a fresh Hub load.
+        eventFarmEnabled = false,
+        eventFarmBoat = "",
+        eventFarmTarget = "",
+        eventFarmVortexEvade = true,
+        eventFarmMoveBoatAway = true,
         -- Farm defaults mirror the reviewed Redz-style flow while keeping a
         -- single explicit weapon and a bounded, reversible local mob group.
         farmLevelEnabled = false,
@@ -377,8 +439,66 @@ end)(Flow)
         if type(data.allFruits) == "boolean" then state.allFruits = data.allFruits end
         if type(data.selectedFruits) == "table" then state.selectedFruits = copy(data.selectedFruits) end
         if type(data.storeFruits) == "boolean" then state.storeFruits = data.storeFruits end
+        if type(data.espMasterEnabled) == "boolean" then state.espMasterEnabled = data.espMasterEnabled end
+        if type(data.espAdvancedMode) == "boolean" then state.espAdvancedMode = data.espAdvancedMode end
+        if type(data.espMaxDistance) == "number" then state.espMaxDistance = math.max(0, math.min(30000, data.espMaxDistance)) end
+        -- Profiles saved before unlimited range existed only contain the old
+        -- 4,000-stud default. Migrate that default once, while leaving all
+        -- later range choices untouched.
+        if (tonumber(data.espRangeDefaultRevision) or 0) < 1 then state.espMaxDistance = 0 end
+        state.espRangeDefaultRevision = 1
+        if type(data.espTextSize) == "number" then state.espTextSize = math.max(8, math.min(28, data.espTextSize)) end
+        if type(data.espTextOutline) == "boolean" then state.espTextOutline = data.espTextOutline end
+        if type(data.espFillTransparency) == "number" then state.espFillTransparency = math.max(0, math.min(1, data.espFillTransparency)) end
+        if type(data.espOutlineTransparency) == "number" then state.espOutlineTransparency = math.max(0, math.min(1, data.espOutlineTransparency)) end
+        if type(data.espBoxThickness) == "number" then state.espBoxThickness = math.max(1, math.min(8, data.espBoxThickness)) end
+        if type(data.espBoxTransparency) == "number" then state.espBoxTransparency = math.max(0, math.min(1, data.espBoxTransparency)) end
+        if type(data.espTracerThickness) == "number" then state.espTracerThickness = math.max(1, math.min(6, data.espTracerThickness)) end
+        if type(data.espTracerTransparency) == "number" then state.espTracerTransparency = math.max(0, math.min(0.95, data.espTracerTransparency)) end
+        if type(data.espTracerOrigin) == "string" and (data.espTracerOrigin == "bottom" or data.espTracerOrigin == "center") then state.espTracerOrigin = data.espTracerOrigin end
+        if type(data.espRefreshInterval) == "number" then state.espRefreshInterval = math.max(0.20, math.min(3, data.espRefreshInterval)) end
+        if type(data.espTypes) == "table" then
+            for kind, template in pairs(defaults.espTypes) do
+                local saved, target = data.espTypes[kind], state.espTypes[kind]
+                if type(saved) == "table" and type(target) == "table" then
+                    for _, flag in ipairs({"enabled", "showName", "showDistance", "showHealth", "highlight", "box", "tracer"}) do
+                        if type(saved[flag]) == "boolean" then target[flag] = saved[flag] end
+                    end
+                    if type(saved.color) == "table" then
+                        target.color = {
+                            math.max(0, math.min(255, math.floor(tonumber(saved.color[1]) or template.color[1]))),
+                            math.max(0, math.min(255, math.floor(tonumber(saved.color[2]) or template.color[2]))),
+                            math.max(0, math.min(255, math.floor(tonumber(saved.color[3]) or template.color[3]))),
+                        }
+                    end
+                end
+            end
+        end
         if type(data.antiAfkEnabled) == "boolean" then state.antiAfkEnabled = data.antiAfkEnabled end
         if type(data.removeFogEnabled) == "boolean" then state.removeFogEnabled = data.removeFogEnabled end
+        if type(data.boatGeneralEnabled) == "boolean" then state.boatGeneralEnabled = data.boatGeneralEnabled end
+        if type(data.boatSpeedOverride) == "boolean" then state.boatSpeedOverride = data.boatSpeedOverride end
+        if type(data.boatSpeed) == "number" then state.boatSpeed = math.max(40, math.min(400, data.boatSpeed)) end
+        if type(data.boatTorqueOverride) == "boolean" then state.boatTorqueOverride = data.boatTorqueOverride end
+        if type(data.boatTorque) == "number" then state.boatTorque = math.max(1, math.min(20, data.boatTorque)) end
+        if type(data.boatTurnSpeedOverride) == "boolean" then state.boatTurnSpeedOverride = data.boatTurnSpeedOverride end
+        if type(data.boatTurnSpeed) == "number" then state.boatTurnSpeed = math.max(0.01, math.min(12, data.boatTurnSpeed)) end
+        if type(data.boatFloatEnabled) == "boolean" then state.boatFloatEnabled = data.boatFloatEnabled end
+        if type(data.boatFloatHeightOverride) == "boolean" then state.boatFloatHeightOverride = data.boatFloatHeightOverride end
+        if type(data.boatFloatHeight) == "number" then state.boatFloatHeight = math.max(0, math.min(500, data.boatFloatHeight)) end
+        if type(data.boatFloatVerticalRate) == "number" then state.boatFloatVerticalRate = math.max(20, math.min(300, data.boatFloatVerticalRate)) end
+        if type(data.boatObstacleEnabled) == "boolean" then state.boatObstacleEnabled = data.boatObstacleEnabled end
+        if type(data.boatObstacleDelay) == "number" then state.boatObstacleDelay = math.max(0.2, math.min(5, data.boatObstacleDelay)) end
+        if type(data.boatObstacleSpeed) == "number" then state.boatObstacleSpeed = math.max(0, math.min(150, data.boatObstacleSpeed)) end
+        if type(data.boatObstacleExtra) == "number" then state.boatObstacleExtra = math.max(20, math.min(300, data.boatObstacleExtra)) end
+        if type(data.boatObstacleRise) == "number" then state.boatObstacleRise = math.max(50, math.min(500, data.boatObstacleRise)) end
+        if type(data.boatObstacleReturn) == "number" then state.boatObstacleReturn = math.max(50, math.min(500, data.boatObstacleReturn)) end
+        -- A saved profile remembers what the player selected, never a live
+        -- navigation instruction. eventFarmEnabled deliberately remains false.
+        if type(data.eventFarmBoat) == "string" then state.eventFarmBoat = data.eventFarmBoat end
+        if type(data.eventFarmTarget) == "string" and (data.eventFarmTarget == "" or data.eventFarmTarget == "terror_shark") then state.eventFarmTarget = data.eventFarmTarget end
+        if type(data.eventFarmVortexEvade) == "boolean" then state.eventFarmVortexEvade = data.eventFarmVortexEvade end
+        if type(data.eventFarmMoveBoatAway) == "boolean" then state.eventFarmMoveBoatAway = data.eventFarmMoveBoatAway end
         if type(data.farmLevelEnabled) == "boolean" then state.farmLevelEnabled = data.farmLevelEnabled end
         if type(data.farmAutoAttack) == "boolean" then state.farmAutoAttack = data.farmAutoAttack end
         if type(data.autoCombatMobs) == "boolean" then state.autoCombatMobs = data.autoCombatMobs end
@@ -492,8 +612,46 @@ end)(Flow)
             allFruits = state.allFruits,
             selectedFruits = state.selectedFruits,
             storeFruits = state.storeFruits,
+            espMasterEnabled = state.espMasterEnabled == true,
+            espAdvancedMode = state.espAdvancedMode == true,
+            espMaxDistance = state.espMaxDistance,
+            espRangeDefaultRevision = state.espRangeDefaultRevision,
+            espTextSize = state.espTextSize,
+            espTextOutline = state.espTextOutline == true,
+            espFillTransparency = state.espFillTransparency,
+            espOutlineTransparency = state.espOutlineTransparency,
+            espBoxThickness = state.espBoxThickness,
+            espBoxTransparency = state.espBoxTransparency,
+            espTracerThickness = state.espTracerThickness,
+            espTracerTransparency = state.espTracerTransparency,
+            espTracerOrigin = state.espTracerOrigin,
+            espRefreshInterval = state.espRefreshInterval,
+            espTypes = copy(state.espTypes),
             antiAfkEnabled = state.antiAfkEnabled,
             removeFogEnabled = state.removeFogEnabled,
+            boatGeneralEnabled = state.boatGeneralEnabled == true,
+            boatSpeedOverride = state.boatSpeedOverride == true,
+            boatSpeed = state.boatSpeed,
+            boatTorqueOverride = state.boatTorqueOverride == true,
+            boatTorque = state.boatTorque,
+            boatTurnSpeedOverride = state.boatTurnSpeedOverride == true,
+            boatTurnSpeed = state.boatTurnSpeed,
+            boatFloatEnabled = state.boatFloatEnabled == true,
+            boatFloatHeightOverride = state.boatFloatHeightOverride == true,
+            boatFloatHeight = state.boatFloatHeight,
+            boatFloatVerticalRate = state.boatFloatVerticalRate,
+            boatObstacleEnabled = state.boatObstacleEnabled == true,
+            boatObstacleDelay = state.boatObstacleDelay,
+            boatObstacleSpeed = state.boatObstacleSpeed,
+            boatObstacleExtra = state.boatObstacleExtra,
+            boatObstacleRise = state.boatObstacleRise,
+            boatObstacleReturn = state.boatObstacleReturn,
+            -- Do not serialize eventFarmEnabled: a reload must never resume
+            -- avatar/boat automation without a fresh toggle action.
+            eventFarmBoat = state.eventFarmBoat,
+            eventFarmTarget = state.eventFarmTarget,
+            eventFarmVortexEvade = state.eventFarmVortexEvade == true,
+            eventFarmMoveBoatAway = state.eventFarmMoveBoatAway == true,
             farmLevelEnabled = state.farmLevelEnabled,
             farmAutoAttack = state.farmAutoAttack,
             autoCombatMobs = state.autoCombatMobs,
@@ -1022,6 +1180,12 @@ end)(Flow)
         if type(options.maxAttempts) == "number" then
             ticket.maxAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(options.maxAttempts)))
         end
+        -- Optional, owner-scoped callbacks used by the Event Farm diagnostic
+        -- run. They observe the already-unforced arrival window; they never
+        -- influence routing, movement, confirmation, or retry behavior.
+        if type(options.arrivalDiagnostics) == "table" then
+            ticket.arrivalDiagnostics = options.arrivalDiagnostics
+        end
     end
 
     function Teleport:IsActive(ticket)
@@ -1458,12 +1622,25 @@ end)(Flow)
         if not root or not position then return false, "arrival_root_missing" end
         local observationSeconds = ticket and tonumber(ticket.arrivalConfirmSeconds) or self.ArrivalConfirmSeconds
         observationSeconds = math.max(0.20, math.min(self.ArrivalConfirmSeconds, observationSeconds or self.ArrivalConfirmSeconds))
+        local diagnostics = ticket and ticket.arrivalDiagnostics
+        local function observe(callback, payload)
+            if diagnostics and type(diagnostics[callback]) == "function" then
+                pcall(diagnostics[callback], payload)
+            end
+        end
+        observe("onConfirmStart", {
+            attempt = ticket and ticket.currentAttempt or nil,
+            observationSeconds = observationSeconds,
+            root = root,
+            humanoid = self:GetHumanoid(),
+        })
         local deadline = os.clock() + observationSeconds
         local last = root.Position
-        local largestStep = 0
+        local largestStep, frames = 0, 0
         repeat
             if ticket and self:IsCancelled(ticket) then return false, "cancelled" end
             task.wait(0.05)
+            frames = frames + 1
             root = self:GetRoot()
             if not root then return false, "arrival_root_missing" end
             local delta = (root.Position - last).Magnitude
@@ -1472,9 +1649,20 @@ end)(Flow)
         until os.clock() >= deadline
         local distance = (root.Position - position).Magnitude
         local confirmed = distance <= self.ArrivalTolerance
+        observe("onConfirmEnd", {
+            attempt = ticket and ticket.currentAttempt or nil,
+            observationSeconds = observationSeconds,
+            frames = frames,
+            largestStep = largestStep,
+            distance = distance,
+            confirmed = confirmed,
+            root = root,
+            humanoid = self:GetHumanoid(),
+        })
         self:RecordTravel(ticket, "teleport_arrival_check", "ok=" .. tostring(confirmed) .. "|distance=" .. string.format("%.1f", distance) .. "|maxStep=" .. string.format("%.1f", largestStep), {
             distance = math.floor(distance * 10 + 0.5) / 10,
             maxStep = math.floor(largestStep * 10 + 0.5) / 10,
+            frames = frames,
         })
         if confirmed then return true, "arrival_confirmed" end
         return false, "arrival_server_corrected:" .. string.format("%.1f", distance)
@@ -1490,6 +1678,7 @@ end)(Flow)
         maximumAttempts = math.max(1, math.min(self.MaximumClearanceAttempts, math.floor(maximumAttempts)))
         for attempt = 1, maximumAttempts do
             if self:IsCancelled(ticket) then break end
+            ticket.currentAttempt = attempt
             local moved, reason, routeInfo = self:MoveRoute(position, ticket, speed)
             if moved then
                 -- Release the local movement state before deciding whether the
@@ -2224,9 +2413,26 @@ end)(Flow)
     -- do not abandon the known Worker route at the old three-second boundary.
     SubmergedExit.WorkerStreamTimeout = 12
     SubmergedExit.NativeArrivalDistance = 500
-    SubmergedExit.DialogueTimeout = 3.5
-    SubmergedExit.GatewayTimeout = 4.5
+    -- Live mobile capture measured the Worker dialogue/Gateway transition at
+    -- roughly 12.6 seconds. These windows cover its typewriter/animation and
+    -- replication delay rather than falling into an unsafe world-route early.
+    SubmergedExit.DialogueTimeout = 8
+    SubmergedExit.GatewayTimeout = 15
     SubmergedExit.ArrivalTimeout = 8
+    -- These Gateway buttons were structurally observed in the live Worker
+    -- menu. Other location requests use verified free Tiki first, then the
+    -- ordinary planner from normal Third Sea space.
+    SubmergedExit.ObservedNativeKeys = {
+        ["Tiki Outpost"] = true,
+        ["Sea Castle"] = true,
+    }
+    -- Price observed in the current native Gateway. This is a routing guard,
+    -- not a fabricated payment request: when funds are known to be below this
+    -- price, the hub chooses the verified free Tiki button immediately.
+    SubmergedExit.ObservedNativePrices = {
+        ["Sea Castle"] = 10000,
+        ["Tiki Outpost"] = 0,
+    }
     SubmergedExit.State = {
         attempts = 0,
         nativeSuccesses = 0,
@@ -2294,6 +2500,13 @@ end)(Flow)
         return rootOf(player and player.Character)
     end
 
+    function SubmergedExit:GetBeli()
+        local data = player and player:FindFirstChild("Data")
+        local value = data and (data:FindFirstChild("Beli") or data:FindFirstChild("Money"))
+        local amount = tonumber(value and value.Value)
+        return amount
+    end
+
     function SubmergedExit:IsOnSubmergedIsland()
         local farm = Flow.Features and Flow.Features.Farm
         if farm and type(farm.IsOnSubmergedIsland) == "function" then
@@ -2305,9 +2518,32 @@ end)(Flow)
     end
 
     function SubmergedExit:GetWorker()
-        local npcs = workspace and workspace:FindFirstChild("NPCs")
-        local worker = npcs and npcs:FindFirstChild("Submarine Worker")
-        return worker and worker:IsA("Model") and worker or nil
+        if not workspace then return nil end
+        -- The live exit capture proved the NPC can be interactive while not
+        -- parented under Workspace.NPCs. Search that fast path first, then the
+        -- streamed Workspace tree; restricting this to NPCs made the native
+        -- path falsely report that an on-screen Worker did not exist.
+        local npcs = workspace:FindFirstChild("NPCs")
+        -- The current NPC registration is "Submarine Worker2" on Submerged
+        -- Island. Keep the legacy spelling as a compatibility fallback for
+        -- older map revisions, but always prefer the live/interactable Worker2
+        -- over any stale decorative or streamed legacy copy.
+        local names = {"Submarine Worker2", "Submarine Worker"}
+        local worker
+        for _, name in ipairs(names) do
+            worker = npcs and npcs:FindFirstChild(name)
+            if worker then break end
+        end
+        if not worker then
+            for _, name in ipairs(names) do
+                local ok, discovered = pcall(function() return workspace:FindFirstChild(name, true) end)
+                if ok and discovered then
+                    worker = discovered
+                    break
+                end
+            end
+        end
+        return worker and (worker:IsA("Model") or worker:IsA("BasePart")) and worker or nil
     end
 
     function SubmergedExit:GetWorkerPosition(worker)
@@ -2315,7 +2551,7 @@ end)(Flow)
         if not worker then return self.WorkerFallbackPosition end
         local ok, pivot = pcall(function() return worker:GetPivot() end)
         if ok and pivot then return pivot.Position end
-        local part = worker:FindFirstChildWhichIsA("BasePart", true)
+        local part = worker:IsA("BasePart") and worker or worker:FindFirstChildWhichIsA("BasePart", true)
         return part and part.Position or self.WorkerFallbackPosition
     end
 
@@ -2335,6 +2571,35 @@ end)(Flow)
     end
 
     function SubmergedExit:OpenWorkerDialogue(worker)
+        -- Worker2 is registered by the game through NPCManager rather than a
+        -- ProximityPrompt/ClickDetector. Calling this public local entry point
+        -- is exactly the same dialogue path reached by the normal NPC click;
+        -- it does not construct a dialogue or call a transport Remote. The
+        -- method intentionally waits until the player closes the dialogue, so
+        -- run it in its own task and let the caller observe the visible option.
+        local replicatedStorage = game:GetService("ReplicatedStorage")
+        local managerModule = replicatedStorage and replicatedStorage:FindFirstChild("NPCManager", true)
+        if managerModule then
+            local required, manager = pcall(require, managerModule)
+            if required and type(manager) == "table" and type(manager.getNPCsByName) == "function" and type(manager.startDialogue) == "function" then
+                local names = {worker and worker.Name or "Submarine Worker2", "Submarine Worker2", "Submarine Worker"}
+                for _, name in ipairs(names) do
+                    if type(name) == "string" then
+                        local listed, npcs = pcall(manager.getNPCsByName, name)
+                        local npc = listed and type(npcs) == "table" and npcs[1] or nil
+                        local stateOk, interactable = false, false
+                        if npc then stateOk, interactable = pcall(function() return npc:getIfInteractable() end) end
+                        if npc and stateOk and interactable then
+                            task.spawn(function()
+                                pcall(function() manager.startDialogue(npc) end)
+                            end)
+                            return true, "npc_manager"
+                        end
+                    end
+                end
+            end
+        end
+
         local prompt = worker and worker:FindFirstChildWhichIsA("ProximityPrompt", true)
         local usePrompt = Flow:GetExecutorFunction("fireproximityprompt")
         if prompt and usePrompt then
@@ -2353,7 +2618,7 @@ end)(Flow)
         -- the same normal mouse path captured from the verified user action;
         -- it does not call a game Remote or fabricate dialogue data.
         local camera = workspace and workspace.CurrentCamera
-        local part = worker and worker:FindFirstChildWhichIsA("BasePart", true)
+        local part = worker and (worker:IsA("BasePart") and worker or worker:FindFirstChildWhichIsA("BasePart", true))
         if virtualInput and camera and part then
             local point, onScreen = camera:WorldToViewportPoint(part.Position)
             if onScreen then
@@ -2369,16 +2634,49 @@ end)(Flow)
 
     function SubmergedExit:GetTravelOptionButton()
         local gui = player and player:FindFirstChildOfClass("PlayerGui")
-        local dialogue = gui and gui:FindFirstChild("DialogueGui")
-        if not gui or not dialogue or not visibleTree(dialogue, gui) then return nil end
+        if not gui then return nil end
 
-        -- In the verified Worker dialogue option1 is the visible "Travel"
-        -- choice and option2 is "Nevermind". The rendered text is built from
-        -- nested glyph objects, so the stable option index is used rather than
-        -- guessing from transient child label text.
-        for _, object in ipairs(dialogue:GetDescendants()) do
-            if object:IsA("GuiObject") and string.find(string.lower(object.Name or ""), "option1", 1, true) then
-                local button = object:FindFirstChildWhichIsA("TextButton", true)
+        -- The Worker dialogue is an intermediate screen: Option1 is Travel and
+        -- only after pressing it does the Gateway appear. UI revisions can put
+        -- Option1 directly on the TextButton (rather than around one), or move
+        -- the dialogue outside the old DialogueGui container. Check both the
+        -- stable option index and its rendered Travel label across PlayerGui.
+        local function normalized(value)
+            return string.lower(tostring(value or "")):gsub("[^%w]", "")
+        end
+        local function isTravelText(object)
+            return (object:IsA("TextButton") or object:IsA("TextLabel")) and normalized(object.Text) == "travel"
+        end
+        local function optionButton(object)
+            if object:IsA("TextButton") then return object end
+            return object:FindFirstChildWhichIsA("TextButton", true)
+        end
+
+        -- Prefer a button explicitly rendered as Travel. This remains correct
+        -- even if the UI no longer names its option containers Option1.
+        for _, object in ipairs(gui:GetDescendants()) do
+            if isTravelText(object) and visibleTree(object, gui) then
+                if object:IsA("TextButton") then return object end
+                local ancestor = object.Parent
+                for _ = 1, 5 do
+                    if not ancestor or ancestor == gui then break end
+                    local button = optionButton(ancestor)
+                    if button and visibleTree(button, gui) then return button end
+                    ancestor = ancestor.Parent
+                end
+            end
+        end
+
+        -- The text may be made from glyph instances. In that case, Option1 is
+        -- the game-defined Worker Travel action. Include the object itself so
+        -- a direct TextButton named Option1 is not accidentally skipped.
+        for _, object in ipairs(gui:GetDescendants()) do
+            -- Current live layout names the frame dynamically, for example
+            -- "table: <id>:1:0:option1". Option1 is therefore a suffix, not
+            -- the complete instance name; its direct child is TextButton
+            -- "button" with an intentionally empty Text property.
+            if object:IsA("GuiObject") and string.find(normalized(object.Name), "option1", 1, true) then
+                local button = optionButton(object)
                 if button and visibleTree(button, gui) then return button end
             end
         end
@@ -2389,6 +2687,31 @@ end)(Flow)
         local gui = player and player:FindFirstChildOfClass("PlayerGui")
         if not button or not gui or not visibleTree(button, gui) then return false, "submarine_button_unavailable" end
 
+        -- The live Worker control is a TextButton named "button" inside the
+        -- dynamic Option1 frame. Activate() did not advance this game UI in a
+        -- live run, so dispatch the actual connected button signal first. This
+        -- invokes the same local dialogue callback as the rendered control,
+        -- rather than guessing a Remote or a destination payload.
+        local firesignal = Flow.Executor and Flow.Executor.firesignal
+        local inspectConnections = Flow:GetExecutorFunction("getconnections")
+        if firesignal then
+            for _, signalName in ipairs({"MouseButton1Click", "Activated"}) do
+                local signal = button[signalName]
+                local shouldFire = true
+                if inspectConnections then
+                    local inspected, connections = pcall(inspectConnections, signal)
+                    if inspected and type(connections) == "table" then shouldFire = #connections > 0 end
+                end
+                if shouldFire then
+                    local signaled = pcall(function() firesignal(signal) end)
+                    if signaled then return true, "signal_" .. signalName end
+                end
+            end
+        end
+
+        local activated = pcall(function() button:Activate() end)
+        if activated then return true, "activate" end
+
         if virtualInput then
             local position, size = button.AbsolutePosition, button.AbsoluteSize
             if size.X > 1 and size.Y > 1 then
@@ -2398,15 +2721,6 @@ end)(Flow)
                 end)
                 if clicked then return true, "mouse" end
             end
-        end
-
-        local activated = pcall(function() button:Activate() end)
-        if activated then return true, "activate" end
-
-        local firesignal = Flow.Executor and Flow.Executor.firesignal
-        if firesignal then
-            local signaled = pcall(function() firesignal(button.MouseButton1Click) end)
-            if signaled then return true, "signal" end
         end
         return false, "submarine_button_click_failed"
     end
@@ -2480,11 +2794,35 @@ end)(Flow)
         self.State.attempts = self.State.attempts + 1
         self:Record("submarine_exit_begin", "destination=" .. tostring(destination.name or destination.key))
 
-        -- Never attempt a world/direct route while the character is still in
-        -- the underwater map. The only verified first leg is the Worker route
-        -- to free Tiki; the ordinary planner may run only after that native
-        -- server relocation is confirmed. This prevents an obstacle/water
-        -- fallback from climbing out of the island into lethal open water.
+        -- The live capture confirmed the Gateway's real visible button names,
+        -- including Sea Castle. Use that native button directly when it is an
+        -- observed key; this lets Auto Raid leave Submerged straight for the
+        -- summon island rather than performing an unnecessary second route.
+        local requestedKey = destination.nativeKey or destination.key
+        local nativePrice = self.ObservedNativePrices[requestedKey]
+        local beli = nativePrice and self:GetBeli() or nil
+        local canAffordNative = nativePrice == nil or nativePrice <= 0 or beli == nil or beli >= nativePrice
+        if self.ObservedNativeKeys[requestedKey] and canAffordNative then
+            local used, nativeReason = self:UseNativeExit(destination)
+            if used then
+                self.State.nativeSuccesses = self.State.nativeSuccesses + 1
+                self:SetResult("native_submarine", nativeReason, destination)
+                self:Record("submarine_exit_end", "mode=native_direct|key=" .. tostring(requestedKey) .. "|reason=" .. tostring(nativeReason))
+                return true, nativeReason, {mode = "native_submarine", reason = nativeReason, target = destination.name}
+            end
+            self:Record("submarine_exit_direct_failed", "key=" .. tostring(requestedKey) .. "|reason=" .. tostring(nativeReason))
+        elseif self.ObservedNativeKeys[requestedKey] and nativePrice and beli ~= nil then
+            -- Do not spend the timeout attempting a paid Gateway entry that the
+            -- replicated wallet already proves unaffordable. Tiki is free and
+            -- is the verified way to leave before resuming the shared planner.
+            self:Record("submarine_exit_paid_skip", "key=" .. tostring(requestedKey) .. "|price=" .. tostring(nativePrice) .. "|beli=" .. tostring(beli) .. "|via=tiki_free")
+        end
+
+        -- No world/direct planner is allowed while still underwater. If the
+        -- requested native choice was unavailable, use the fully confirmed
+        -- free Tiki path first; only a confirmed server relocation may resume
+        -- Portal/map/direct planning. This is the guard that prevents a climb
+        -- into the submerged ceiling/open-water death zone.
         local tiki = self:GetVerifiedTikiExit()
         if not tiki.position then
             self:SetResult("failed", "tiki_exit_location_missing", destination)
@@ -2500,18 +2838,12 @@ end)(Flow)
         end
 
         self.State.nativeSuccesses = self.State.nativeSuccesses + 1
-        -- Selecting Tiki itself is complete as soon as its native relocation
-        -- has passed the strict movement/stability confirmation in UseNativeExit.
-        if destination.key == "Tiki Outpost" or destination.name == "Tiki Outpost" then
+        if requestedKey == "Tiki Outpost" then
             self:SetResult("native_submarine", nativeReason, destination)
             self:Record("submarine_exit_end", "mode=native_tiki|reason=" .. tostring(nativeReason))
             return true, nativeReason, {mode = "native_submarine", reason = nativeReason, target = destination.name}
         end
 
-        -- The final destination is now planned from normal Third Sea space,
-        -- where Portal Fruit, confirmed map portals and direct movement are
-        -- valid again. Raid supplies owner="raid" so the resumed route keeps
-        -- the same movement ownership/cancellation semantics.
         self:Record("submarine_exit_resume_planner", "via=tiki|destination=" .. tostring(destination.name or destination.key))
         local moved, reason, plan = teleport:TravelToPosition(
             destination.position,
@@ -3840,9 +4172,9 @@ end)(Flow)
     -- up/down correction loop. The stabilizer holds only vertical gravity;
     -- CFrame is used for a material combat-anchor displacement, not as a
     -- per-frame elevator.
-    Farm.HoverHorizontalTolerance = 3
-    Farm.HoverVerticalTolerance = 5
-    Farm.HoverCorrectionInterval = 0.18
+    Farm.HoverHorizontalTolerance = 2
+    Farm.HoverVerticalTolerance = 3
+    Farm.HoverCorrectionInterval = 0.10
     -- A nearby combat re-anchor is not a world route. Keep it bounded so a
     -- moving NPC or an underground support probe cannot send Farm into a tall
     -- adaptive-clearance loop between mobs.
@@ -3892,6 +4224,12 @@ end)(Flow)
         hoverCorrections = 0,
         hoverVerticalCorrections = 0,
         hoverLastDriftY = 0,
+        -- v1.5.9 diagnostic counters. These only observe the hover worker;
+        -- they do not alter provider, tolerance, or correction behavior.
+        hoverAttemptCount = 0,
+        hoverCorrectionCount = 0,
+        hoverLastHorizontal = nil,
+        hoverProviderFailCount = 0,
         externalStageKey = nil,
         combatAnchor = nil,
         combatAnchorMob = nil,
@@ -4081,6 +4419,7 @@ end)(Flow)
                 state.hoverCenter = liveCenter
                 state.hoverProviderMissingAt = nil
             else
+                state.hoverProviderFailCount = (state.hoverProviderFailCount or 0) + 1
                 state.hoverProviderMissingAt = state.hoverProviderMissingAt or os.clock()
                 if os.clock() - state.hoverProviderMissingAt > 0.35 then return nil end
             end
@@ -4102,12 +4441,13 @@ end)(Flow)
     -- server reconciliation of a per-frame local Y assignment looks like the
     -- player repeatedly rising and falling.
     function Farm:ApplyHover(force)
+        local state = self.State
+        state.hoverAttemptCount = (state.hoverAttemptCount or 0) + 1
         local targetCFrame = self:GetHoverCFrame()
         local root = self:GetRoot()
         if not targetCFrame or not root then return false end
         if not self:EnsureHoverStabilizer() then return false end
 
-        local state = self.State
         local drift = targetCFrame.Position - root.Position
         local horizontal = Vector3.new(drift.X, 0, drift.Z).Magnitude
         local vertical = math.abs(drift.Y)
@@ -4115,6 +4455,10 @@ end)(Flow)
         local needsCorrection = force == true
             or horizontal > self.HoverHorizontalTolerance
             or vertical > self.HoverVerticalTolerance
+        if needsCorrection then
+            state.hoverCorrectionCount = (state.hoverCorrectionCount or 0) + 1
+            state.hoverLastHorizontal = horizontal
+        end
         local now = os.clock()
         if needsCorrection and (force == true or now - (state.hoverLastCorrectionAt or -math.huge) >= self.HoverCorrectionInterval) then
             -- A reposition is now exceptional: initial placement, a genuine
@@ -4196,6 +4540,13 @@ end)(Flow)
         if type(owner) ~= "string" or owner == "" then return false, "hover_owner_invalid" end
         if type(centerProvider) ~= "function" then return false, "hover_provider_invalid" end
         return self:BeginHoverAt(center, false, owner, activeCheck, centerProvider, "above", heightOverride)
+    end
+
+    function Farm:IsHoverActive(owner)
+        local state = self.State
+        if not state or not state.hoverConnection then return false end
+        if owner and state.hoverOwner ~= owner then return false end
+        return true
     end
 
     function Farm:EndExternalHover(owner)
@@ -4946,7 +5297,9 @@ end)(Flow)
             -- briefly instead of hovering and retrying the same untouchable
             -- clone indefinitely. Group failures first switch to exact target
             -- mode so a good neighboring NPC is never discarded blindly.
-            if pending.models and #pending.models == 1 then self:MarkRejectedTarget(pending.models[1]) end
+            if pending.models and #pending.models == 1 and not self.State.skipRejectedTargetForSeaBeast then
+                self:MarkRejectedTarget(pending.models[1])
+            end
             if self.State.consecutiveRejected >= 2 then
                 self.State.singleTargetMode = true
                 self.State.adaptiveAttackCooldown = math.min(0.35, (self.State.adaptiveAttackCooldown or 0.25) + 0.02)
@@ -5083,8 +5436,9 @@ end)(Flow)
         return self.State.combatThreadAvailable == true
     end
 
-    function Farm:GetCombatHitData(target)
+    function Farm:GetCombatHitData(target, rangeOverride)
         local root = self:GetRoot()
+        local hitRange = tonumber(rangeOverride) or 80
         local enemies = self:GetEnemies()
         if not root or not enemies or not target then return nil, nil, nil end
         local hitData, health = {}, {}
@@ -5093,7 +5447,7 @@ end)(Flow)
             local enemyRoot = modelRoot(enemy)
             local sameTarget = enemy == target
             local eligible = self.State.singleTargetMode == true and sameTarget or enemy.Name == target.Name
-            if eligible and alive(enemy) and enemyRoot and (enemyRoot.Position - root.Position).Magnitude <= 80 and not self:IsTemporarilyRejectedTarget(enemy) then
+            if eligible and alive(enemy) and enemyRoot and (enemyRoot.Position - root.Position).Magnitude <= hitRange and not self:IsTemporarilyRejectedTarget(enemy) then
                 local part = nil
                 for _, name in ipairs(preferredParts) do part = enemy:FindFirstChild(name); if part then break end end
                 part = part or enemy.PrimaryPart or enemyRoot
@@ -5109,18 +5463,62 @@ end)(Flow)
         return hitData[self.State.attackPrimaryIndex][2], hitData, health
     end
 
-    function Farm:Attack(target)
+    function Farm:Attack(target, options)
+        options = options or {}
         if not State.farmAutoAttack or not alive(target) then return false, "attack_off" end
         self:UpdateAttackFeedback()
         local now = os.clock()
         local cooldown = math.max(0.25, self.State.adaptiveAttackCooldown or 0.25)
-        if now - self.State.lastAttackAt < cooldown then return true, "cooldown" end
+        if now - self.State.lastAttackAt < cooldown then
+            local character = self:GetCharacter()
+            local weapon = character and character:FindFirstChildWhichIsA("Tool")
+            if weapon then
+                warn("[farm] cooldown on weapon:", weapon.Name, "| last use:", os.clock() - (self.State.lastAttackAt or 0))
+            end
+            return true, "cooldown"
+        end
         local tool, reason = self:EquipSelectedWeapon()
         if not tool then return false, reason end
         local attack, hit = self:GetCombatRemotes()
         if not attack or not hit then return false, "combat_remotes_unavailable" end
-        local primaryPart, hitData, health = self:GetCombatHitData(target)
-        if not primaryPart or #hitData == 0 then return false, "target_out_of_range" end
+        local primaryPart, hitData, health = self:GetCombatHitData(target, options.range)
+        if not primaryPart or #hitData == 0 then
+            -- v1.6.3 range diagnosis. Farm has no EventFarm journal closure, so
+            -- retain primitive evidence in State; EventFarm copies it into its
+            -- own journal immediately when this exact return reason is observed.
+            local root = self:GetRoot()
+            local enemies = self:GetEnemies()
+            local debugEnemies = {}
+            if enemies and root then
+                for _, enemy in ipairs(enemies:GetChildren()) do
+                    local enemyRoot = modelRoot(enemy)
+                    if enemyRoot then
+                        table.insert(debugEnemies, {
+                            name = enemy.Name,
+                            rootName = enemyRoot.Name,
+                            dist = (enemyRoot.Position - root.Position).Magnitude,
+                            sameTarget = enemy == target,
+                            nameMatchesTarget = target and enemy.Name == target.Name or false,
+                            alive = alive(enemy),
+                        })
+                    end
+                end
+            end
+            local sharkRoot = modelRoot(target)
+            self.State.lastAttackRangeDebug = {
+                playerRootPos = root and {root.Position.X, root.Position.Y, root.Position.Z} or nil,
+                questMob = self.State.quest and self.State.quest.mob or nil,
+                singleTargetMode = self.State.singleTargetMode == true,
+                enemiesContainer = enemies and enemies:GetFullName() or nil,
+                sharkName = target and target.Name or nil,
+                sharkParent = target and target.Parent and target.Parent.Name or nil,
+                sharkInEnemies = target ~= nil and enemies ~= nil and target.Parent == enemies,
+                sharkRootName = sharkRoot and sharkRoot.Name or nil,
+                sharkDist = sharkRoot and root and (sharkRoot.Position - root.Position).Magnitude or -1,
+                enemies = debugEnemies,
+            }
+            return false, "target_out_of_range"
+        end
         local root = self:GetRoot()
         -- Tool:Activate is the game's normal local input path and, unlike a
         -- keyboard simulation, works on touch-only Delta/Android clients. Its
@@ -5546,6 +5944,2801 @@ end)(Flow)
     end
 
     Flow.Features.AutoCombat = AutoCombat
+end)(Flow)
+
+-- >>> MODULE: features/boat/boat_local.lua
+;(function(Flow)
+    local Boat = {}
+    local Players = Flow.Services.Players
+    local Workspace = Flow.Services.Workspace
+    local ReplicatedStorage = Flow.Services.ReplicatedStorage
+    local RunService = Flow.Services.RunService
+    local state = Flow.State
+    local player = Flow.Player or (Players and Players.LocalPlayer)
+
+    Boat.Snapshots = setmetatable({}, {__mode = "k"})
+    Boat.Active = nil
+    Boat.ConnectionName = "FlowKanLocalBoat/Control"
+    Boat.Started = false
+
+    local limits = {
+        speed = {40, 400},
+        torque = {1, 20},
+        turnSpeed = {0.01, 12},
+        height = {0, 500},
+        verticalRate = {20, 300},
+        obstacleDelay = {0.2, 5},
+        obstacleSpeed = {0, 150},
+        obstacleExtra = {20, 300},
+        obstacleRise = {50, 500},
+        obstacleReturn = {50, 500},
+    }
+
+    local function clamp(key, value, fallback)
+        local range = limits[key]
+        value = tonumber(value)
+        if not value then return fallback end
+        return math.max(range[1], math.min(range[2], value))
+    end
+
+    local function round(value, places)
+        local factor = 10 ^ (places or 0)
+        return math.floor(value * factor + 0.5) / factor
+    end
+
+    local function samePlayer(instance)
+        return instance and player and instance.Parent == player.Character
+    end
+
+    local function getOwnedBoat()
+        local boats = Workspace and Workspace:FindFirstChild("Boats")
+        if not boats or not player then return nil end
+        for _, boat in ipairs(boats:GetChildren()) do
+            local owner = boat:FindFirstChild("Owner")
+            if boat.Name and owner and owner:IsA("ObjectValue") and owner.Value == player then
+                local seat = boat:FindFirstChild("VehicleSeat")
+                if seat and seat:IsA("VehicleSeat") then
+                    return boat, seat
+                end
+            end
+        end
+        return nil
+    end
+
+    local function getMovement()
+        local global = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Global")
+        if not global then return nil end
+        local ok, api = pcall(require, global)
+        if not ok or type(api) ~= "table" or type(api.getLocalShipFromPlayer) ~= "function" then return nil end
+        local found, ship = pcall(api.getLocalShipFromPlayer, player)
+        if not found or type(ship) ~= "table" then return nil end
+        return ship.Movement
+    end
+
+    local function capture(boat, seat, movement)
+        local snapshot = Boat.Snapshots[seat]
+        if snapshot then
+            snapshot.boat = boat
+            if movement and snapshot.movement ~= movement then
+                snapshot.movement = movement
+                snapshot.positionOffset = movement.PositionOffset
+                snapshot.yOffset = movement.YOffset and movement.YOffset.Y or snapshot.yOffset
+            end
+            return snapshot
+        end
+        local bodyPosition = seat:FindFirstChild("BodyPosition")
+        snapshot = {
+            boat = boat,
+            seat = seat,
+            movement = movement,
+            maxSpeed = seat.MaxSpeed,
+            torque = seat.Torque,
+            turnSpeed = seat.TurnSpeed,
+            bodyPosition = bodyPosition,
+            bodyPositionY = bodyPosition and bodyPosition.Position.Y or 0,
+            positionOffset = movement and movement.PositionOffset or Vector3.new(),
+            yOffset = movement and movement.YOffset and movement.YOffset.Y or (bodyPosition and bodyPosition.Position.Y or 0),
+            lift = 0,
+            obstacleLift = 0,
+            blockedFor = 0,
+            generalApplied = false,
+            restoreFloatPending = false,
+        }
+        Boat.Snapshots[seat] = snapshot
+        return snapshot
+    end
+
+    local function restoreGeneral(snapshot)
+        if not snapshot or not snapshot.seat or not snapshot.seat.Parent then return end
+        pcall(function()
+            snapshot.seat.MaxSpeed = snapshot.maxSpeed
+            snapshot.seat.Torque = snapshot.torque
+            snapshot.seat.TurnSpeed = snapshot.turnSpeed
+        end)
+    end
+
+    local function restoreFloat(snapshot)
+        if not snapshot then return end
+        if snapshot.movement then
+            pcall(function() snapshot.movement.PositionOffset = snapshot.positionOffset end)
+        end
+        if snapshot.bodyPosition and snapshot.bodyPosition.Parent then
+            pcall(function()
+                local current = snapshot.bodyPosition.Position
+                snapshot.bodyPosition.Position = Vector3.new(current.X, snapshot.bodyPositionY, current.Z)
+            end)
+        end
+        snapshot.lift = 0
+        snapshot.obstacleLift = 0
+        snapshot.blockedFor = 0
+        snapshot.restoreFloatPending = false
+    end
+
+    local function restoreSnapshot(snapshot)
+        restoreGeneral(snapshot)
+        restoreFloat(snapshot)
+    end
+
+    local function restoreOtherActive(currentSeat)
+        local active = Boat.Active
+        if active and active.seat ~= currentSeat then
+            restoreSnapshot(active)
+            Boat.Active = nil
+        end
+    end
+
+    local function localDriver(seat)
+        return seat and seat.Occupant and samePlayer(seat.Occupant)
+    end
+
+    function Boat:GetLimits()
+        return limits
+    end
+
+    function Boat:GetSnapshot()
+        local boat, seat = getOwnedBoat()
+        local movement = getMovement()
+        local snapshot = seat and capture(boat, seat, movement) or nil
+        local function effective(overrideKey, valueKey, baseline)
+            if state[overrideKey] == true and type(state[valueKey]) == "number" then return state[valueKey] end
+            return baseline
+        end
+        local baseSpeed = snapshot and snapshot.maxSpeed or 142.5
+        local baseTorque = snapshot and snapshot.torque or 4
+        local baseTurnSpeed = snapshot and snapshot.turnSpeed or 1
+        local baseHeight = snapshot and snapshot.positionOffset and snapshot.positionOffset.Y or 0
+        return {
+            boatName = boat and boat.Name or nil,
+            driver = seat and localDriver(seat) or false,
+            generalEnabled = state.boatGeneralEnabled == true,
+            floatEnabled = state.boatFloatEnabled == true,
+            obstacleEnabled = state.boatObstacleEnabled == true,
+            speed = effective("boatSpeedOverride", "boatSpeed", baseSpeed),
+            torque = effective("boatTorqueOverride", "boatTorque", baseTorque),
+            turnSpeed = effective("boatTurnSpeedOverride", "boatTurnSpeed", baseTurnSpeed),
+            height = effective("boatFloatHeightOverride", "boatFloatHeight", baseHeight),
+            verticalRate = state.boatFloatVerticalRate or 100,
+            obstacleDelay = state.boatObstacleDelay or 1,
+            obstacleSpeed = state.boatObstacleSpeed or 18,
+            obstacleExtra = state.boatObstacleExtra or 80,
+            obstacleRise = state.boatObstacleRise or 220,
+            obstacleReturn = state.boatObstacleReturn or 260,
+            activeLift = snapshot and snapshot.lift or 0,
+            obstacleLift = snapshot and snapshot.obstacleLift or 0,
+        }
+    end
+
+    function Boat:SetGeneralEnabled(active, save)
+        state.boatGeneralEnabled = active == true
+        if not state.boatGeneralEnabled and Boat.Active then restoreGeneral(Boat.Active) end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+        return state.boatGeneralEnabled
+    end
+
+    function Boat:SetFloatEnabled(active, save)
+        state.boatFloatEnabled = active == true
+        if not state.boatFloatEnabled and Boat.Active then restoreFloat(Boat.Active) end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+        return state.boatFloatEnabled
+    end
+
+    function Boat:SetObstacleEnabled(active, save)
+        state.boatObstacleEnabled = active == true
+        if not state.boatObstacleEnabled and Boat.Active then
+            Boat.Active.blockedFor = 0
+            Boat.Active.obstacleLift = 0
+        end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+        return state.boatObstacleEnabled
+    end
+
+    function Boat:SetNumber(key, value, save)
+        local mapping = {
+            speed = {stateKey = "boatSpeed", override = "boatSpeedOverride", limit = "speed", places = 0},
+            torque = {stateKey = "boatTorque", override = "boatTorqueOverride", limit = "torque", places = 1},
+            turnSpeed = {stateKey = "boatTurnSpeed", override = "boatTurnSpeedOverride", limit = "turnSpeed", places = 1},
+            height = {stateKey = "boatFloatHeight", override = "boatFloatHeightOverride", limit = "height", places = 0},
+            verticalRate = {stateKey = "boatFloatVerticalRate", limit = "verticalRate", places = 0},
+            obstacleDelay = {stateKey = "boatObstacleDelay", limit = "obstacleDelay", places = 1},
+            obstacleSpeed = {stateKey = "boatObstacleSpeed", limit = "obstacleSpeed", places = 0},
+            obstacleExtra = {stateKey = "boatObstacleExtra", limit = "obstacleExtra", places = 0},
+            obstacleRise = {stateKey = "boatObstacleRise", limit = "obstacleRise", places = 0},
+            obstacleReturn = {stateKey = "boatObstacleReturn", limit = "obstacleReturn", places = 0},
+        }
+        local entry = mapping[key]
+        if not entry then return nil, "unknown_setting" end
+        local current = state[entry.stateKey]
+        local checked = clamp(entry.limit, value, current or limits[entry.limit][1])
+        state[entry.stateKey] = round(checked, entry.places)
+        if entry.override then state[entry.override] = true end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+        return state[entry.stateKey]
+    end
+
+    function Boat:ResetGeneralToGameDefault(save)
+        state.boatSpeedOverride = false
+        state.boatTorqueOverride = false
+        state.boatTurnSpeedOverride = false
+        if Boat.Active then
+            restoreGeneral(Boat.Active)
+            Boat.Active.generalApplied = false
+        end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+    end
+
+    function Boat:ResetFloatToGameDefault(save)
+        state.boatFloatHeightOverride = false
+        if Boat.Active then restoreFloat(Boat.Active) end
+        if save ~= false and Flow.Config then Flow.Config:Save() end
+    end
+
+    local function applyGeneral(snapshot)
+        if state.boatGeneralEnabled ~= true then
+            if snapshot.generalApplied then
+                restoreGeneral(snapshot)
+                snapshot.generalApplied = false
+            end
+            return
+        end
+        local hasOverride = state.boatSpeedOverride or state.boatTorqueOverride or state.boatTurnSpeedOverride
+        if not hasOverride then
+            -- Turning the master on by itself is intentionally a no-op: the
+            -- original game values remain untouched until a slider is moved.
+            if snapshot.generalApplied then
+                restoreGeneral(snapshot)
+                snapshot.generalApplied = false
+            end
+            return
+        end
+        local seat = snapshot.seat
+        pcall(function()
+            if state.boatSpeedOverride then seat.MaxSpeed = clamp("speed", state.boatSpeed, snapshot.maxSpeed) end
+            if state.boatTorqueOverride then seat.Torque = clamp("torque", state.boatTorque, snapshot.torque) end
+            if state.boatTurnSpeedOverride then seat.TurnSpeed = clamp("turnSpeed", state.boatTurnSpeed, snapshot.turnSpeed) end
+        end)
+        snapshot.generalApplied = true
+    end
+
+    local function approach(current, target, amount)
+        if current < target then return math.min(target, current + amount) end
+        return math.max(target, current - amount)
+    end
+
+    local function applyFloat(snapshot, dt)
+        if state.boatFloatEnabled ~= true then
+            if snapshot.restoreFloatPending or snapshot.lift ~= 0 or snapshot.obstacleLift ~= 0 then restoreFloat(snapshot) end
+            return
+        end
+        local movement = snapshot.movement
+        local bodyPosition = snapshot.bodyPosition
+        if not movement or not bodyPosition or not bodyPosition.Parent then return end
+
+        local baseLift = state.boatFloatHeightOverride and clamp("height", state.boatFloatHeight, 0) or 0
+        local obstacleTarget = 0
+        if state.boatObstacleEnabled == true then
+            local seat = snapshot.seat
+            local horizontal = seat.AssemblyLinearVelocity
+            local physicalSpeed = Vector3.new(horizontal.X, 0, horizontal.Z).Magnitude
+            local forwardIntent = (seat.ThrottleFloat or 0) > 0.5
+            local requestedSpeed = math.abs(tonumber(movement.Velocity) or 0)
+            local stalled = forwardIntent and requestedSpeed > 20 and physicalSpeed < clamp("obstacleSpeed", state.boatObstacleSpeed, 18)
+            if stalled then
+                snapshot.blockedFor = snapshot.blockedFor + dt
+            else
+                snapshot.blockedFor = 0
+            end
+            if snapshot.blockedFor >= clamp("obstacleDelay", state.boatObstacleDelay, 1) then
+                obstacleTarget = clamp("obstacleExtra", state.boatObstacleExtra, 80)
+            end
+        else
+            snapshot.blockedFor = 0
+        end
+
+        local obstacleRate = obstacleTarget > snapshot.obstacleLift
+            and clamp("obstacleRise", state.boatObstacleRise, 220)
+            or clamp("obstacleReturn", state.boatObstacleReturn, 260)
+        snapshot.obstacleLift = approach(snapshot.obstacleLift, obstacleTarget, obstacleRate * dt)
+        local target = baseLift + snapshot.obstacleLift
+        if target == 0 and snapshot.lift == 0 then
+            -- Float master alone also remains a no-op until height or obstacle
+            -- lift is actually requested.
+            if snapshot.restoreFloatPending then restoreFloat(snapshot) end
+            return
+        end
+        local verticalRate = clamp("verticalRate", state.boatFloatVerticalRate, 100)
+        snapshot.lift = approach(snapshot.lift, target, verticalRate * dt)
+
+        -- Preserve native X/Z offset. Only the existing vertical boat support is adjusted.
+        pcall(function()
+            local base = snapshot.positionOffset
+            movement.PositionOffset = Vector3.new(base.X, base.Y + snapshot.lift, base.Z)
+            local current = bodyPosition.Position
+            bodyPosition.Position = Vector3.new(current.X, snapshot.yOffset + snapshot.lift, current.Z)
+        end)
+        snapshot.restoreFloatPending = true
+    end
+
+    function Boat:Step(dt)
+        local boat, seat = getOwnedBoat()
+        if not seat or not localDriver(seat) then
+            restoreOtherActive(nil)
+            return
+        end
+        local movement = getMovement()
+        local snapshot = capture(boat, seat, movement)
+        snapshot.movement = movement or snapshot.movement
+        restoreOtherActive(seat)
+        Boat.Active = snapshot
+        applyGeneral(snapshot)
+        applyFloat(snapshot, dt)
+    end
+
+    function Boat:Start()
+        if self.Started then return end
+        self.Started = true
+        if not RunService then return end
+        RunService:BindToRenderStep(self.ConnectionName, Enum.RenderPriority.Last.Value, function(dt)
+            local ok, reason = pcall(function() Boat:Step(dt) end)
+            if not ok and Flow.Log then Flow:Log("Local Boat: " .. tostring(reason)) end
+        end)
+    end
+
+    function Boat:Shutdown()
+        if RunService then pcall(function() RunService:UnbindFromRenderStep(self.ConnectionName) end) end
+        self.Started = false
+        for _, snapshot in pairs(self.Snapshots) do restoreSnapshot(snapshot) end
+        self.Active = nil
+    end
+
+    Flow.Features.BoatLocal = Boat
+end)(Flow)
+
+-- >>> MODULE: features/sea/event_farm.lua
+;(function(Flow)
+    local EventFarm = {}
+    local State = Flow.State
+    local Players = Flow.Services.Players
+    local Workspace = Flow.Services.Workspace
+    local ReplicatedStorage = Flow.Services.ReplicatedStorage
+    local RunService = Flow.Services.RunService
+    local player = Flow.Player
+
+    -- These helpers are used by callbacks defined before their implementations
+    -- (Vortex watchers, external follow and transit). Forward declarations are
+    -- required in Luau; without them those callbacks resolve globals and crash
+    -- with "attempt to call a nil value" at targetRoot/targetAlive/drive.
+    local drive, targetRoot, targetAlive, distance, isTerrorSharkTargetValid
+
+    EventFarm.Version = "1.6.6"
+    -- Extractor-inspired sea traversal: local hull noclip, a bounded horizontal
+    -- thrust and controlled seat altitude, with snapshots and cleanup.
+    EventFarm.TransitCruiseSeatY = 24
+    EventFarm.TransitSpeed = 260
+    EventFarm.TransitStuckSeconds = 1.2
+    EventFarm.TransitMinimumProgress = 12
+    EventFarm.TransitMaxRecoveries = 3
+    EventFarm.TerrorSharkDangerAnimationId = "rbxassetid://14977820392"
+    EventFarm.TerrorSharkCombatLateralOffset = 0
+    EventFarm.TerrorSharkCombatHeight = 50
+    EventFarm.TerrorSharkEvadeOffset = Vector3.new(0, 250, 5)
+    EventFarm.TerrorSharkEvadeGrace = 0.45
+    EventFarm.BoatSafeStableSeconds = 0.8
+    EventFarm.BoatVerticalSafetySpeed = 500
+    EventFarm.TerrorSharkEmergencyRange = 280
+    EventFarm.TerrorSharkVortexResponseRange = 500
+    -- A correct west/open-sea launch clears Tiki at the first or second low
+    -- clearance step. Never scale the island's tallest geometry with a hull
+    -- that made no meaningful forward progress: replace it instead.
+    EventFarm.TikiExitMaxAttempts = 3
+    -- Tiki policy: lift immediately and never lower while the boat remains
+    -- inside the island. Subsequent attempts only climb further.
+    EventFarm.TikiExitFirstLift = 350
+    EventFarm.TikiExitSecondLift = 575
+    EventFarm.TikiExitThirdLift = 800
+    EventFarm.TikiExitMinimumProjection = 100
+    -- Target and boat-safety policy. These limits are enforced twice: while
+    -- discovering a Terrorshark and immediately before combat can unseat the
+    -- player, so a distant replicated model can never trigger a long jump.
+    EventFarm.TerrorSharkMaxTargetDistance = 1400
+    EventFarm.TerrorSharkMaxCombatStartDistance = 3000
+    EventFarm.TerrorSharkMaxTrackedDistance = 3000
+    EventFarm.BoatSafeDistance = 500
+    EventFarm.BoatAwayMaximumDistance = 2600
+    EventFarm.BoatCompassClearDanger = 1
+    EventFarm.BoatFarReplacementDistance = 2600
+    EventFarm.BoatAwayMinimumTravel = 650
+    EventFarm.BoatAwayTimeout = 8
+    EventFarm.TerrorSharkCloseDodgeRange = 170
+    EventFarm.SupportedEvents = {
+        {id = "terror_shark", name = "Terror Shark"},
+    }
+    -- Confirmed in the previous Tiki explorations: this is the WEST dealer,
+    -- facing the endless/open sea — not the east dock toward other islands.
+    EventFarm.VerifiedTikiWestDealer = Vector3.new(-16928.927734375, 7.7660064697265625, 434.6199951171875)
+    EventFarm.TikiOpenSeaDirection = Vector3.new(-0.9952259659767151, 0, 0.09759844839572906)
+    EventFarm.Runtime = {
+        active = false,
+        generation = 0,
+        phase = "idle",
+        reason = nil,
+        boat = nil,
+        seat = nil,
+        movement = nil,
+        original = nil,
+        baseBodyPosition = nil,
+        lift = 0,
+        targetLift = 0,
+        liftRate = 0,
+        direction = nil,
+        -- `speed` is the native Movement.Velocity command. Live Tiki testing
+        -- confirmed that positive throttle follows the requested physical
+        -- direction; the old negative sign sent the boat into the island sea.
+        speed = 0,
+        cruiseDirection = nil,
+        lastPosition = nil,
+        -- Set by the native writer when the owned hull/forces disappear. This
+        -- is handled by the Farm worker, not from RenderStep itself.
+        boatLostReason = nil,
+        -- v1.6.6: a hull can vanish after combat has truly started. Preserve
+        -- the player/target duel; reset for a replacement only after the target
+        -- reaches its terminal defeated state.
+        deferBoatLossUntilTargetDefeated = false,
+        combatBoatLossReason = nil,
+        resettingAfterBoatLoss = false,
+        forceFreshBoat = false,
+        tikiSeatRecoveryAttempts = 0,
+        stalledFor = 0,
+        preStallLift = nil,
+        stallBoost = 0,
+        marker = {mode = "none", lastGood = nil, seenFor = 0, missingFor = 0},
+        target = nil,
+        targetBackoff = {},
+        boatSafeTarget = nil,
+        boatSafeAt = 0,
+        boatAwayActive = false,
+        awayProgressCheck = nil,
+        boatAwayFallbackTarget = nil,
+        -- Raid exit is debounced so a model oscillating around the 520-stud
+        -- detection boundary cannot alternate sea_cruise/evading every frame.
+        raidExitQuietSince = nil,
+        raidExitCooldown = 0,
+        emergencyUntil = 0,
+        vortexSignal = nil,
+        evadeActive = false,
+        combatOffset = nil,
+        lastStopReason = nil,
+        lastFailureReason = nil,
+        journal = {},
+        journalLimit = 700,
+        transit = {active = false, collisions = {}, thrust = nil, lastSampleAt = 0, samplePosition = nil, stuckFor = 0, recoveries = 0, avoidUntil = 0, avoidDirection = nil, lastSeatFixAt = 0},
+        vortexConnections = {},
+        controlConnection = nil,
+        nativeReady = false,
+        vortexLift = nil,
+        lastVortexObservation = nil,
+        lastNotice = {},
+        startedAt = 0,
+        statusChangedAt = 0,
+    }
+
+    local function now()
+        return os.clock()
+    end
+
+    local function lower(value)
+        return string.lower(tostring(value or ""))
+    end
+
+    local function safeGet(object, property)
+        local ok, value = pcall(function() return object and object[property] end)
+        return ok and value or nil
+    end
+
+    local function rootPart()
+        local character = player and player.Character
+        return character and character:FindFirstChild("HumanoidRootPart") or nil
+    end
+
+    local function humanoid()
+        local character = player and player.Character
+        return character and character:FindFirstChildOfClass("Humanoid") or nil
+    end
+
+    local function isAlive()
+        local hum = humanoid()
+        return hum and hum.Health > 0
+    end
+
+    -- Plain-number snapshots keep diagnostic journal entries JSON-exportable.
+    -- They intentionally report client-observed state only; no field is
+    -- labelled as a server position or server velocity.
+    local function vectorSnapshot(value)
+        if not value then return nil end
+        return {x = value.X, y = value.Y, z = value.Z}
+    end
+
+    local function humanoidStateName(h)
+        local state = h and h:GetState()
+        return state and state.Name or nil
+    end
+
+    local function positionOf(object)
+        if not object then return nil end
+        local ok, pivot = pcall(function() return object:GetPivot() end)
+        if ok and pivot then return pivot.Position end
+        local position = safeGet(object, "Position")
+        return typeof(position) == "Vector3" and position or nil
+    end
+
+    local function notify(title, message, kind, throttleKey, seconds)
+        local runtime = EventFarm.Runtime
+        local key = throttleKey or title
+        local at = now()
+        if runtime.lastNotice[key] and at - runtime.lastNotice[key] < (seconds or 2) then return end
+        runtime.lastNotice[key] = at
+        Flow:Notify({title = tostring(title), message = tostring(message), type = kind or "info", duration = 4})
+    end
+
+    local function journal(kind, fields)
+        local runtime = EventFarm.Runtime
+        local row = {t = now(), kind = kind, fields = fields or {}}
+        table.insert(runtime.journal, row)
+        if #runtime.journal > (runtime.journalLimit or 700) then table.remove(runtime.journal, 1) end
+    end
+
+    local function setPhase(phase, reason)
+        local runtime = EventFarm.Runtime
+        runtime.phase = phase
+        runtime.reason = reason
+        runtime.statusChangedAt = now()
+        journal("phase", {phase = phase, reason = reason})
+        Flow:Log("Sea Farm | " .. tostring(phase) .. (reason and (" | " .. tostring(reason)) or ""))
+    end
+
+    local function ownedBoatByName(name)
+        local boats = Workspace and Workspace:FindFirstChild("Boats")
+        if not boats then return nil end
+        for _, boat in ipairs(boats:GetChildren()) do
+            local owner = boat:FindFirstChild("Owner")
+            if boat.Name == name and owner and safeGet(owner, "Value") == player then
+                return boat
+            end
+        end
+        return nil
+    end
+
+    local function rootSeat(boat)
+        if not boat then return nil end
+        local direct = boat:FindFirstChild("VehicleSeat")
+        if direct and direct:IsA("VehicleSeat") then return direct end
+        for _, child in ipairs(boat:GetDescendants()) do
+            if child:IsA("VehicleSeat") and child.Name == "VehicleSeat" then return child end
+        end
+        return nil
+    end
+
+    local function localOccupies(seat)
+        local occupant = seat and safeGet(seat, "Occupant")
+        return occupant and occupant.Parent == player.Character
+    end
+
+    local function otherPlayerDrives(seat)
+        local occupant = seat and safeGet(seat, "Occupant")
+        return occupant and occupant.Parent ~= player.Character
+    end
+
+    local function getShipMovement(boat)
+        local global = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Global")
+        if not global then return nil end
+        local ok, api = pcall(require, global)
+        if not ok or type(api) ~= "table" then return nil end
+        local ship
+        if type(api.getShipFromBoat) == "function" then
+            local shipOk, value = pcall(api.getShipFromBoat, boat)
+            if shipOk then ship = value end
+        end
+        if not ship and type(api.getLocalShipFromPlayer) == "function" then
+            local shipOk, value = pcall(api.getLocalShipFromPlayer, player)
+            if shipOk then ship = value end
+        end
+        return ship and ship.Movement or nil
+    end
+
+    local function getBoatInfoList()
+        local module = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Modules")
+        local boatInfo = module and module:FindFirstChild("BoatInfo")
+        if not boatInfo then return {} end
+        local ok, definition = pcall(require, boatInfo)
+        local list = ok and type(definition) == "table" and definition.List or nil
+        if type(list) ~= "table" then return {} end
+        local output = {}
+        for name, info in pairs(list) do
+            if type(name) == "string" and type(info) == "table" then
+                table.insert(output, {
+                    name = name,
+                    display = tostring(info.DisplayName or info.Name or name),
+                    cost = tonumber(info.Cost),
+                    unlocked = info.Unlocked ~= false and info.Locked ~= true,
+                })
+            end
+        end
+        table.sort(output, function(a, b) return a.display < b.display end)
+        return output
+    end
+
+    function EventFarm:GetBoats()
+        return getBoatInfoList()
+    end
+
+    function EventFarm:GetSupportedEvents()
+        local copy = {}
+        for _, definition in ipairs(self.SupportedEvents) do
+            table.insert(copy, {id = definition.id, name = definition.name})
+        end
+        return copy
+    end
+
+    function EventFarm:GetSnapshot()
+        local runtime = self.Runtime
+        local seat = runtime.seat
+        local boat = runtime.boat
+        local physical = seat and seat.AssemblyLinearVelocity or nil
+        return {
+            enabled = runtime.active,
+            phase = runtime.phase,
+            reason = runtime.reason,
+            boat = boat and boat.Name or nil,
+            selectedBoat = State.eventFarmBoat,
+            selectedEvent = State.eventFarmTarget,
+            vortexEvade = State.eventFarmVortexEvade == true,
+            moveBoatAway = State.eventFarmMoveBoatAway == true,
+            lift = runtime.lift,
+            targetLift = runtime.targetLift,
+            markerMode = runtime.marker.mode,
+            dangerLevel = tonumber(player and player:GetAttribute("DangerLevel")) or 0,
+            target = runtime.target and runtime.target.Name or nil,
+            driver = localOccupies(seat),
+            otherDriver = otherPlayerDrives(seat),
+            physicalSpeed = physical and Vector3.new(physical.X, 0, physical.Z).Magnitude or 0,
+        }
+    end
+
+    function EventFarm:SetBoat(name)
+        name = tostring(name or "")
+        local valid = false
+        for _, boat in ipairs(getBoatInfoList()) do
+            if boat.name == name then valid = true break end
+        end
+        if not valid then return false, "boat_not_in_runtime_catalog" end
+        State.eventFarmBoat = name
+        Flow.Config:Save()
+        return true
+    end
+
+    function EventFarm:SetEvent(id)
+        id = tostring(id or "")
+        if id ~= "terror_shark" then return false, "event_not_supported" end
+        State.eventFarmTarget = id
+        Flow.Config:Save()
+        return true
+    end
+
+    function EventFarm:SetVortexEvade(active)
+        State.eventFarmVortexEvade = active == true
+        Flow.Config:Save()
+        return true
+    end
+
+    function EventFarm:SetMoveBoatAway(active)
+        State.eventFarmMoveBoatAway = active == true
+        Flow.Config:Save()
+        return true
+    end
+
+    local function saveControlState(boat, seat, movement)
+        local bodyPosition = seat and seat:FindFirstChild("BodyPosition")
+        local bodyVelocity = seat and seat:FindFirstChild("BodyVelocity")
+        local bodyGyro = seat and seat:FindFirstChild("BodyGyro")
+        if not bodyPosition or not bodyVelocity or not bodyGyro or not movement then
+            return nil, "native_controller_or_forces_missing"
+        end
+        return {
+            boat = boat,
+            seat = seat,
+            movement = movement,
+            bodyPosition = bodyPosition,
+            bodyVelocity = bodyVelocity,
+            bodyGyro = bodyGyro,
+            seatMaxSpeed = seat.MaxSpeed,
+            seatTorque = seat.Torque,
+            seatTurnSpeed = seat.TurnSpeed,
+            movementVelocity = movement.Velocity,
+            movementSteer = movement.Steer,
+            -- Same dual vertical support used by the proven BoatLocal Float:
+            -- PositionOffset plus BodyPosition, never a boat CFrame move.
+            movementPositionOffset = movement.PositionOffset,
+            movementYOffset = (typeof(movement.YOffset) == "Vector3" and movement.YOffset.Y) or bodyPosition.Position.Y,
+            bodyPositionPosition = bodyPosition.Position,
+            bodyVelocityVelocity = bodyVelocity.Velocity,
+            bodyVelocityMaxForce = bodyVelocity.MaxForce,
+            bodyGyroCFrame = bodyGyro.CFrame,
+        }
+    end
+
+    local function restoreBoatControl()
+        local runtime = EventFarm.Runtime
+        local original = runtime.original
+        if original then
+            pcall(function()
+                original.seat.MaxSpeed = original.seatMaxSpeed
+                original.seat.Torque = original.seatTorque
+                original.seat.TurnSpeed = original.seatTurnSpeed
+                original.movement.Velocity = original.movementVelocity
+                original.movement.Steer = original.movementSteer
+                original.movement.PositionOffset = original.movementPositionOffset
+                original.bodyPosition.Position = original.bodyPositionPosition
+                original.bodyVelocity.Velocity = original.bodyVelocityVelocity
+                original.bodyVelocity.MaxForce = original.bodyVelocityMaxForce
+                original.bodyGyro.CFrame = original.bodyGyroCFrame
+            end)
+        end
+        runtime.original = nil
+        runtime.movement = nil
+        runtime.baseBodyPosition = nil
+        runtime.direction = nil
+        runtime.speed = 0
+        runtime.lift = 0
+        runtime.targetLift = 0
+        runtime.liftRate = 0
+        runtime.stalledFor = 0
+        runtime.preStallLift = nil
+        runtime.stallBoost = 0
+        runtime.nativeReady = false
+        runtime.boatLostReason = nil
+        runtime.deferBoatLossUntilTargetDefeated = false
+        runtime.combatBoatLossReason = nil
+        runtime.resettingAfterBoatLoss = false
+        runtime.boatSafeTarget = nil
+        runtime.boatSafeAt = 0
+        runtime.boatAwayActive = false
+        runtime.emergencyUntil = 0
+        runtime.vortexSignal = nil
+        runtime.evadeActive = false
+        runtime.combatOffset = nil
+        runtime.transit = {active = false, collisions = {}, thrust = nil, lastSampleAt = 0, samplePosition = nil, stuckFor = 0, recoveries = 0, avoidUntil = 0, avoidDirection = nil, lastSeatFixAt = 0}
+    end
+
+    local function destroyVortexLift()
+        local lift = EventFarm.Runtime.vortexLift
+        if lift and lift.Parent then pcall(function() lift:Destroy() end) end
+        EventFarm.Runtime.vortexLift = nil
+    end
+
+    local function disconnectVortexWatch()
+        local runtime = EventFarm.Runtime
+        for _, connection in ipairs(runtime.vortexConnections or {}) do
+            pcall(function() connection:Disconnect() end)
+        end
+        runtime.vortexConnections = {}
+        runtime.vortexSignal = nil
+    end
+
+    local function vortexTextMatches(value)
+        local text = lower(value)
+        return text:find("npc.chainshark.vortex", 1, true) ~= nil
+            or text:find("chains hark vortex", 1, true) ~= nil
+            or text:find("suction", 1, true) ~= nil
+    end
+
+    local function valueContainsVortex(value, depth)
+        depth = depth or 0
+        if depth > 3 then return false end
+        local kind = typeof(value)
+        if kind == "string" then return vortexTextMatches(value) end
+        if kind == "Instance" then
+            return vortexTextMatches(value.Name) or vortexTextMatches(value:GetFullName())
+        end
+        if type(value) == "table" then
+            for key, item in pairs(value) do
+                if vortexTextMatches(key) or valueContainsVortex(item, depth + 1) then return true end
+            end
+        end
+        return false
+    end
+
+    local function isVortexTelegraphInstance(instance)
+        return instance and vortexTextMatches(instance.Name)
+    end
+
+    local function recordVortexTelegraph(source)
+        local runtime = EventFarm.Runtime
+        local target = runtime.target
+        if not runtime.active or not target or not targetAlive(target) then return end
+        -- Record the authoritative Vortex/Suction telegraph immediately. The
+        -- old close-range filter discarded the early warning, then fired Test
+        -- 6 only after the player had already fallen from the boat.
+        local label = typeof(source) == "Instance" and source:GetFullName() or tostring(source)
+        runtime.vortexSignal = {at = now(), source = label, instance = source}
+        journal("vortex_signal", {source = label, target = target.Name})
+    end
+
+    local function remoteMayCarryAttackEffects(remote)
+        local name = lower(remote and remote.Name)
+        return name:find("fx", 1, true) ~= nil or name:find("attack", 1, true) ~= nil
+            or name:find("effect", 1, true) ~= nil or name:find("tween", 1, true) ~= nil
+    end
+
+    local function installVortexWatch()
+        disconnectVortexWatch()
+        local runtime = EventFarm.Runtime
+        local function bindRemote(remote)
+            if not remote:IsA("RemoteEvent") or not remoteMayCarryAttackEffects(remote) then return end
+            runtime.vortexConnections[#runtime.vortexConnections + 1] = remote.OnClientEvent:Connect(function(...)
+                local args = table.pack(...)
+                for i = 1, args.n do
+                    if valueContainsVortex(args[i]) then
+                        recordVortexTelegraph("remote:" .. remote:GetFullName())
+                        return
+                    end
+                end
+            end)
+        end
+        runtime.vortexConnections[#runtime.vortexConnections + 1] = Workspace.DescendantAdded:Connect(function(item)
+            if isVortexTelegraphInstance(item) then recordVortexTelegraph(item) end
+        end)
+        runtime.vortexConnections[#runtime.vortexConnections + 1] = ReplicatedStorage.DescendantAdded:Connect(function(item)
+            if item:IsA("RemoteEvent") then bindRemote(item)
+            elseif isVortexTelegraphInstance(item) then recordVortexTelegraph(item) end
+        end)
+        for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
+            if item:IsA("RemoteEvent") then bindRemote(item) end
+        end
+    end
+
+    local function endExternalCombat()
+        local farm = Flow.Features.Farm
+        if farm and farm.EndExternalHover then
+            pcall(function() farm:EndExternalHover("sea_event_farm") end)
+            pcall(function() farm:EndExternalHover("sea_event_vortex_evade") end)
+        end
+    end
+
+    local function terrorDangerAnimation(target)
+        local hum = target and target:FindFirstChildOfClass("Humanoid")
+        if not hum then return false end
+        local ok, tracks = pcall(function() return hum:GetPlayingAnimationTracks() end)
+        if not ok or type(tracks) ~= "table" then return false end
+        for _, track in ipairs(tracks) do
+            local animation = track and track.Animation
+            if animation and animation.AnimationId == EventFarm.TerrorSharkDangerAnimationId then return true, track end
+        end
+        return false
+    end
+
+    local function combatFollow(target)
+        local farm = Flow.Features.Farm
+        local runtime = EventFarm.Runtime
+        if not farm or not farm.BeginExternalFollow then return false end
+        local initial = targetRoot(target)
+        if not initial then return false end
+        local playerRoot = rootPart()
+        local flat = playerRoot and Vector3.new(playerRoot.Position.X-initial.Position.X,0,playerRoot.Position.Z-initial.Position.Z) or Vector3.new(0,0,1)
+        if flat.Magnitude < 1 then flat = Vector3.new(0,0,1) end
+        runtime.combatOffset = flat.Unit * EventFarm.TerrorSharkCombatLateralOffset
+        return farm:BeginExternalFollow("sea_event_farm", initial.Position + runtime.combatOffset, function()
+            local current = targetRoot(target)
+            return current and (current.Position + (runtime.combatOffset or Vector3.new(0,0,65))) or nil
+        end, function()
+            return EventFarm.Runtime.active and not EventFarm.Runtime.evadeActive and targetAlive(target) and isTerrorSharkTargetValid(target)
+        end, EventFarm.TerrorSharkCombatHeight)
+    end
+
+    local function stopTransitAssist(reason)
+        local runtime, transit = EventFarm.Runtime, EventFarm.Runtime.transit
+        if not transit then return end
+        if transit.thrust and transit.thrust.Parent then pcall(function() transit.thrust:Destroy() end) end
+        transit.thrust = nil
+        for part, value in pairs(transit.collisions or {}) do
+            if part and part.Parent then pcall(function() part.CanCollide = value end) end
+        end
+        transit.collisions = {}
+        if transit.active then journal("transit_restore", {reason = reason}) end
+        transit.active = false
+    end
+
+    local function startTransitAssist()
+        local runtime = EventFarm.Runtime
+        if State.eventFarmTransitAssist == false or not runtime.seat or not runtime.boat then return end
+        local transit = runtime.transit
+        if transit.active then return end
+        transit.active = true
+        transit.collisions = {}
+        local function snapshot(container)
+            for _, item in ipairs(container:GetDescendants()) do
+                if item:IsA("BasePart") and transit.collisions[item] == nil then
+                    transit.collisions[item] = item.CanCollide
+                    item.CanCollide = false
+                end
+            end
+        end
+        snapshot(runtime.boat)
+        local character = player and player.Character
+        if character then snapshot(character) end
+        -- The native ship Movement/BodyGyro is the only propulsion writer.
+        -- Local noclip supports passage; no second BodyVelocity is attached.
+        transit.thrust = nil
+        transit.lastSampleAt, transit.samplePosition, transit.stuckFor, transit.recoveries, transit.startedAt = now(), runtime.seat.Position, 0, 0, now()
+        journal("transit_start", {seatY = EventFarm.TransitCruiseSeatY, speed = EventFarm.TransitSpeed})
+    end
+
+    local function transitObstacleStep()
+        local runtime, transit, seat = EventFarm.Runtime, EventFarm.Runtime.transit, EventFarm.Runtime.seat
+        if not transit.active or not seat or not runtime.direction then return end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {runtime.boat, player and player.Character}
+        local origin = seat.Position + Vector3.new(0, 8, 0)
+        local hit = Workspace:Raycast(origin, runtime.direction * 110, params)
+        if hit and hit.Instance and not hit.Instance:IsDescendantOf(Workspace.Terrain) then
+            -- Noclip local hull can cross this geometry; preserve a single
+            -- native heading rather than assigning a competing lateral thrust.
+            transit.avoidDirection = nil
+            transit.avoidUntil = 0
+            journal("transit_obstacle_bypass", {part = hit.Instance.Name, mode = "noclip_single_heading"})
+        elseif not runtime.boatAwayActive
+            and (runtime.phase == "sea_cruise" or runtime.phase == "calibrating_sea_marker" or runtime.phase == "calibrating_existing_sea")
+            and runtime.cruiseDirection then
+            -- A temporary obstacle/raid heading must never become the permanent
+            -- cruise course after the blocking ray is clear.
+            drive(runtime.cruiseDirection, 300)
+        end
+    end
+
+    local function transitStep(dt)
+        local runtime, transit, seat = EventFarm.Runtime, EventFarm.Runtime.transit, EventFarm.Runtime.seat
+        if not transit.active or not seat or not seat.Parent or not localOccupies(seat) then return end
+        local direction = runtime.direction
+        if transit.avoidDirection and now() < transit.avoidUntil then direction = transit.avoidDirection else transit.avoidDirection = nil end
+        -- Horizontal velocity is owned by native drive(direction, speed).
+        -- The native ship BodyPosition owns altitude. Directly assigning the
+        -- VehicleSeat CFrame fought its lift/marker writer and caused the
+        -- observed +/- 4k stud/s vertical teleport loop. Transit owns only
+        -- local collision and horizontal thrust; it never writes seat Y.
+        transit.lastSeatFixAt = now()
+        if now() - transit.lastSampleAt < 0.5 then return end
+        local progress = transit.samplePosition and (seat.Position - transit.samplePosition).Magnitude or 0
+        transit.lastSampleAt, transit.samplePosition = now(), seat.Position
+        local canWatchProgress = (runtime.phase == "calibrating_sea_marker" or runtime.phase == "calibrating_existing_sea")
+            and now() - (transit.startedAt or now()) >= 5
+        if canWatchProgress and direction and runtime.speed >= 80 and progress < EventFarm.TransitMinimumProgress then
+            transit.stuckFor = transit.stuckFor + 0.5
+            if transit.stuckFor >= EventFarm.TransitStuckSeconds then
+                transit.stuckFor, transit.recoveries = 0, transit.recoveries + 1
+                -- Do not reanchor the seat during a native BodyPosition
+                -- cruise. Reapply only horizontal thrust and let the existing
+                -- Tiki/stall recovery own vertical correction.
+                journal("transit_stuck_recovery", {attempt = transit.recoveries, progress = progress, mode = "observe_native"})
+                if transit.recoveries >= EventFarm.TransitMaxRecoveries then
+                    -- A sampled stall is not evidence that the hull died. Keep
+                    -- the native boat, reset the observer and let the normal
+                    -- Tiki exit/recovery path decide whether a repurchase is due.
+                    journal("transit_stall_observed", {recoveries = transit.recoveries})
+                    transit.recoveries = 0
+                end
+            end
+        else
+            transit.stuckFor = 0
+        end
+        transitObstacleStep()
+    end
+
+    local function disconnectControl()
+        local runtime = EventFarm.Runtime
+        local control = runtime.controlConnection
+        if type(control) == "string" then
+            -- EventFarm owns one last-render writer while it is active. This
+            -- explicitly removes it before any restoration or replacement.
+            pcall(function() RunService:UnbindFromRenderStep(control) end)
+        elseif control then
+            pcall(function() control:Disconnect() end)
+        end
+        runtime.controlConnection = nil
+    end
+
+    local function applyControl(dt)
+        local runtime = EventFarm.Runtime
+        if not runtime.active or not runtime.original or not runtime.nativeReady then return end
+        local original = runtime.original
+        local seat = original.seat
+        local seatExists = seat ~= nil
+        local seatParented = seatExists and seat.Parent ~= nil
+        local boatExists = original.boat ~= nil
+        local boatParented = boatExists and original.boat.Parent ~= nil
+        if not seatExists or not seatParented or not boatExists or not boatParented then
+            -- The writer runs at RenderStep frequency. Journal this diagnostic
+            -- once per loss, not once per rendered frame.
+            if not runtime.boatLostReason then
+                local h, root = humanoid(), rootPart()
+                journal("boat_removed_detail", {
+                    seatExists = seatExists,
+                    seatParented = seatParented,
+                    boatExists = boatExists,
+                    boatParented = boatParented,
+                    humanoidState = h and h:GetState().Name or nil,
+                    playerPos = root and {x = root.Position.X, y = root.Position.Y, z = root.Position.Z} or nil,
+                    seatPos = seat and {x = seat.Position.X, y = seat.Position.Y, z = seat.Position.Z} or nil,
+                })
+            end
+            runtime.boatLostReason = runtime.boatLostReason or "boat_removed"
+            runtime.direction = nil
+            runtime.speed = 0
+            return
+        end
+        if not original.bodyPosition or not original.bodyPosition.Parent
+            or not original.bodyVelocity or not original.bodyVelocity.Parent
+            or not original.bodyGyro or not original.bodyGyro.Parent then
+            runtime.boatLostReason = runtime.boatLostReason or "native_boat_forces_removed"
+            runtime.direction = nil
+            runtime.speed = 0
+            return
+        end
+        runtime.lastPosition = seat.Position
+        if otherPlayerDrives(seat) then
+            -- Never compete with another player for a helm.
+            runtime.direction = nil
+            runtime.speed = 0
+            return
+        end
+        if not localOccupies(seat) then
+            runtime.direction = nil
+            runtime.speed = 0
+            return
+        end
+        local direction = runtime.direction
+        local current = runtime.lift
+        local target = runtime.targetLift
+        local rate = math.max(1, runtime.liftRate)
+        local delta = target - current
+        if math.abs(delta) > 0.01 then
+            local step = math.min(math.abs(delta), rate * math.max(0, dt))
+            runtime.lift = current + (delta > 0 and step or -step)
+        end
+        transitStep(dt)
+        pcall(function()
+            seat.MaxSpeed = math.max(original.seatMaxSpeed, math.max(60, math.abs(runtime.speed)))
+            seat.Torque = math.max(original.seatTorque, 4)
+            seat.TurnSpeed = math.max(original.seatTurnSpeed, 1)
+            original.movement.Velocity = direction and runtime.speed or 0
+            original.movement.Steer = 0
+            if direction and direction.Magnitude > 0.01 then
+                -- The live Tiki probe established the current native mapping:
+                -- positive Movement.Velocity follows the gyro's LookVector.
+                -- Aim toward the requested physical direction and let the
+                -- native controller move the hull; never translate CFrame.
+                original.bodyGyro.CFrame = CFrame.lookAt(Vector3.zero, direction.Unit)
+            end
+            -- BodyPosition's horizontal target is maintained by the game's
+            -- native ship controller. Preserve its live X/Z each heartbeat;
+            -- only this feature's vertical offset is imposed.
+            -- Mirror BoatLocal Float exactly: preserve native X/Z values and
+            -- add the same progressive lift to both vertical support channels.
+            local offset = original.movementPositionOffset or Vector3.new()
+            original.movement.PositionOffset = Vector3.new(offset.X, offset.Y + runtime.lift, offset.Z)
+            local live = original.bodyPosition.Position
+            original.bodyPosition.Position = Vector3.new(live.X, original.movementYOffset + runtime.lift, live.Z)
+        end)
+    end
+
+    local function attachNativeControl(boat)
+        local runtime = EventFarm.Runtime
+        local seat = rootSeat(boat)
+        if not seat then return false, "driver_seat_missing" end
+        if otherPlayerDrives(seat) then return false, "boat_is_driven_by_someone_else" end
+        local hum = humanoid()
+        if not hum then return false, "character_missing" end
+        if not localOccupies(seat) then
+            pcall(function() seat:Sit(hum) end)
+            local deadline = now() + 3
+            repeat task.wait(0.1) until localOccupies(seat) or now() >= deadline or not EventFarm.Runtime.active
+        end
+        if not localOccupies(seat) then return false, "could_not_enter_driver_seat" end
+        local movement = getShipMovement(boat)
+        local original, reason = saveControlState(boat, seat, movement)
+        if not original then return false, reason end
+        runtime.boat = boat
+        runtime.seat = seat
+        runtime.movement = movement
+        runtime.original = original
+        runtime.baseBodyPosition = original.bodyPositionPosition
+        runtime.lastPosition = seat.Position
+        runtime.stalledFor = 0
+        runtime.preStallLift = nil
+        runtime.stallBoost = 0
+        -- A newly spawned native boat needs a short controller settle before
+        -- the farm touches height. This avoids the game overwriting our first
+        -- progressive lift frame.
+        runtime.nativeReady = false
+        -- The game ship controller rewrites BodyPosition after Heartbeat.
+        -- Write at RenderPriority.Last (as BoatLocal does) so PositionOffset
+        -- and BodyPosition survive into physics. Heartbeat was the direct
+        -- cause of the farm's apparent "no flight" behavior.
+        local bindName = "FlowKanSeaFarm/NativeControl/" .. tostring(runtime.generation)
+        runtime.controlConnection = bindName
+        RunService:BindToRenderStep(bindName, Enum.RenderPriority.Last.Value, function(dt)
+            applyControl(dt)
+        end)
+        return true
+    end
+
+    local function clearNativeControl()
+        stopTransitAssist("native_control_clear")
+        disconnectControl()
+        restoreBoatControl()
+    end
+
+    local function isCurrent(generation)
+        return EventFarm.Runtime.active and EventFarm.Runtime.generation == generation
+    end
+
+    local function waitSeconds(generation, seconds)
+        local deadline = now() + seconds
+        while isCurrent(generation) and not EventFarm.Runtime.boatLostReason and now() < deadline do task.wait(0.05) end
+        return isCurrent(generation) and not EventFarm.Runtime.boatLostReason
+    end
+
+    local function settleNativeBoat(generation)
+        if not waitSeconds(generation, 1.5) then return false end
+        local runtime = EventFarm.Runtime
+        local original = runtime.original
+        if not original or not original.bodyPosition or not original.bodyPosition.Parent then
+            runtime.boatLostReason = runtime.boatLostReason or "native_boat_forces_removed"
+            return false
+        end
+        -- Capture the real post-spawn native anchor for vertical offsets while
+        -- retaining the pre-farm values separately for exact restoration.
+        runtime.baseBodyPosition = original.bodyPosition.Position
+        runtime.lastPosition = runtime.seat and runtime.seat.Position or runtime.lastPosition
+        runtime.nativeReady = true
+        startTransitAssist()
+        return true
+    end
+
+    drive = function(direction, speed)
+        local runtime = EventFarm.Runtime
+        local flat = direction and Vector3.new(direction.X, 0, direction.Z) or nil
+        runtime.direction = flat and flat.Magnitude > 0.01 and flat.Unit or nil
+        -- Live Tiki motion probe: -80 moved +X/-Z (toward the island-side
+        -- sea), while the requested endless-sea course is -X/+Z. Native
+        -- positive throttle is therefore the verified forward command.
+        runtime.speed = runtime.direction and math.abs(tonumber(speed) or 0) or 0
+    end
+
+    local function setLift(target, rate)
+        local runtime = EventFarm.Runtime
+        runtime.targetLift = math.max(0, tonumber(target) or 0)
+        runtime.liftRate = math.max(1, tonumber(rate) or 120)
+    end
+
+    local function waitForLift(generation, target, margin, timeout)
+        local deadline = now() + (timeout or 12)
+        while isCurrent(generation) and not EventFarm.Runtime.boatLostReason and now() < deadline do
+            if math.abs(EventFarm.Runtime.lift - target) <= (margin or 8) then return true end
+            task.wait(0.05)
+        end
+        return false
+    end
+
+    targetRoot = function(target)
+        return target and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart or target:FindFirstChildWhichIsA("BasePart")) or nil
+    end
+
+    local function isTerrorSharkName(name)
+        -- Case, spaces, underscore and hyphen are formatting only. Thus this
+        -- matches Terrorshark, TerrorShark, terror_shark and terror shark.
+        local normalized = lower(name):gsub("[%s_%-]", "")
+        return normalized:find("terrorshark", 1, true) ~= nil
+    end
+
+    local function terrorSharkCandidates()
+        -- Search the Workspace tree only two levels below Workspace. This
+        -- covers Workspace.Enemies.Terrorshark, Workspace.SeaBeasts.TerrorShark
+        -- and an equivalent one-folder container without an unbounded scan of
+        -- effects/projectiles. Candidates are de-duplicated by Instance.
+        local workspaceRoot = Workspace
+        if not workspaceRoot then return {} end
+        local queue, output, seen = {{node = workspaceRoot, depth = 0}}, {}, {}
+        local cursor = 1
+        while cursor <= #queue do
+            local row = queue[cursor]
+            cursor = cursor + 1
+            if row.depth < 2 then
+                for _, child in ipairs(row.node:GetChildren()) do
+                    local depth = row.depth + 1
+                    if child:IsA("Model") and isTerrorSharkName(child.Name) and not seen[child] then
+                        seen[child] = true
+                        output[#output + 1] = child
+                    end
+                    if depth < 2 and (child:IsA("Folder") or child:IsA("Model")) then
+                        queue[#queue + 1] = {node = child, depth = depth}
+                    end
+                end
+            end
+        end
+        return output
+    end
+
+    local function targetOperationalDistance(target)
+        local root = targetRoot(target)
+        local runtime = EventFarm.Runtime
+        local anchor = runtime.seat and runtime.seat.Parent and runtime.seat.Position
+            or (rootPart() and rootPart().Position)
+        return root and anchor and (root.Position - anchor).Magnitude or math.huge
+    end
+
+    isTerrorSharkTargetValid = function(target)
+        if not target or not target.Parent then return false end
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health <= 0 then return false end
+        local runtime = EventFarm.Runtime
+        local limit = runtime.target == target and EventFarm.TerrorSharkMaxTrackedDistance or EventFarm.TerrorSharkMaxTargetDistance
+        return targetOperationalDistance(target) <= limit
+    end
+
+    -- DangerLevel is retained as calibration telemetry only. Live evidence
+    -- showed it remains 600 even after the boat reaches 2,400+ studs from a
+    -- Terrorshark, so it cannot be used as a boolean "compass active" gate.
+    -- Parking is consequently governed by measured boat-to-target separation.
+    local function compassIsClear()
+        return true, tonumber(player and player:GetAttribute("DangerLevel")) or 0
+    end
+
+    local function boatHealthRatio(boat)
+        if not boat then return nil end
+        local current = tonumber(boat:GetAttribute("Health")) or tonumber(boat:GetAttribute("HullHealth"))
+        local maximum = tonumber(boat:GetAttribute("MaxHealth")) or tonumber(boat:GetAttribute("MaxHullHealth"))
+        local healthValue = boat:FindFirstChild("Health", true) or boat:FindFirstChild("HullHealth", true)
+        local maxValue = boat:FindFirstChild("MaxHealth", true) or boat:FindFirstChild("MaxHullHealth", true)
+        if not current and healthValue and (healthValue:IsA("NumberValue") or healthValue:IsA("IntValue")) then current = healthValue.Value end
+        if not maximum and maxValue and (maxValue:IsA("NumberValue") or maxValue:IsA("IntValue")) then maximum = maxValue.Value end
+        if current and maximum and maximum > 0 then return current / maximum, current, maximum end
+        return nil
+    end
+
+    local function visibleTerrorShark()
+        local runtime = EventFarm.Runtime
+        local nearest, nearestDistance
+        for _, object in ipairs(terrorSharkCandidates()) do
+            local blockedUntil = runtime.targetBackoff[object]
+            local d = targetOperationalDistance(object)
+            if (not blockedUntil or now() >= blockedUntil)
+                and isTerrorSharkTargetValid(object)
+                and (not nearestDistance or d < nearestDistance) then
+                nearest, nearestDistance = object, d
+            end
+        end
+        return nearest
+    end
+
+    targetAlive = function(target)
+        if not target or not target.Parent then return false end
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        return not hum or hum.Health > 0
+    end
+
+    distance = function(a, b)
+        if not a or not b then return math.huge end
+        return (a - b).Magnitude
+    end
+
+    local function tikiPosition()
+        local worldOrigin = Workspace and Workspace:FindFirstChild("_WorldOrigin")
+        local locations = worldOrigin and worldOrigin:FindFirstChild("Locations")
+        local tiki = locations and locations:FindFirstChild("Tiki Outpost")
+        return tiki and positionOf(tiki) or nil
+    end
+
+    local function getTikiOpenSeaRoute()
+        local worldOrigin = Workspace and Workspace:FindFirstChild("_WorldOrigin")
+        local spawns = worldOrigin and worldOrigin:FindFirstChild("BoatSpawns")
+        local tiki = tikiPosition()
+        local chosen
+        if spawns and tiki then
+            for _, spawn in ipairs(spawns:GetChildren()) do
+                local offset = spawn.Position - tiki
+                local look = Vector3.new(spawn.CFrame.LookVector.X, 0, spawn.CFrame.LookVector.Z)
+                if offset.Magnitude < 1200 and look.Magnitude > 0.01 then
+                    look = look.Unit
+                    -- The west-facing spawn is the validated endless-sea side,
+                    -- opposite Floating Turtle/Castle. Prefer the most westward
+                    -- real map marker rather than an arbitrary radial vector.
+                    if look.X < -0.8 and (not chosen or look.X < chosen.direction.X) then
+                        chosen = {spawn = spawn, direction = look}
+                    end
+                end
+            end
+        end
+        if chosen then return chosen end
+        return {spawn = nil, direction = EventFarm.TikiOpenSeaDirection, fallback = true}
+    end
+
+    local function isAtTiki(position)
+        if not position then return false end
+        -- Location decides whether the expensive Tiki exit is needed. Danger
+        -- level is used only for height calibration; it can be stale while a
+        -- newly spawned boat is still beside the island.
+        local tiki = tikiPosition()
+        return tiki and (position - tiki).Magnitude <= 1800 or false
+    end
+
+    local function findTikiWestDealer()
+        -- Prefer the exact verified dock point. Scan only to bind the visible
+        -- model to that point; never choose the nearest/east Boat Dealer.
+        local verified = EventFarm.VerifiedTikiWestDealer
+        local best, bestDistance
+        local roots = {Workspace and Workspace:FindFirstChild("NPCs"), Workspace}
+        for _, container in ipairs(roots) do
+            if container then
+                for _, item in ipairs(container:GetDescendants()) do
+                    if lower(item.Name):find("boat dealer", 1, true) then
+                        local model = item:IsA("Model") and item or item:FindFirstAncestorOfClass("Model")
+                        local position = positionOf(model or item)
+                        local d = position and (position - verified).Magnitude or math.huge
+                        if d <= 250 and (not bestDistance or d < bestDistance) then
+                            best, bestDistance = {object = model or item, position = position, verified = true}, d
+                        end
+                    end
+                end
+            end
+        end
+        -- The coordinate itself was measured at the correct WEST dealer. It is
+        -- a safe fallback while that NPC model is not yet streamed locally.
+        return best or {object = nil, position = verified, verified = true, fallback = true}
+    end
+
+    local function acquireBoat(generation)
+        local selected = State.eventFarmBoat
+        if type(selected) ~= "string" or selected == "" then return nil, "boat_not_selected" end
+        local runtime = EventFarm.Runtime
+        local existing = ownedBoatByName(selected)
+        local previousBoat = existing
+        local forceFreshBoat = runtime.forceFreshBoat == true
+        if existing and not forceFreshBoat then return existing end
+        local dealer = findTikiWestDealer()
+        if not dealer then return nil, "boat_dealer_not_found" end
+        local root = rootPart()
+        if not root then return nil, "character_missing" end
+        local dealerDistance = (root.Position - dealer.position).Magnitude
+        if dealerDistance > 18 then
+            setPhase("going_to_dealer")
+            local farm = Flow.Features.Farm
+            if not farm or not farm.MoveTo then return nil, "travel_to_dealer_unavailable" end
+            local arrived = farm:MoveTo(CFrame.new(dealer.position), "sea_event_boat_dealer")
+            if not arrived or not isCurrent(generation) then return nil, "could_not_reach_boat_dealer" end
+            root = rootPart()
+            if not root or (root.Position - dealer.position).Magnitude > 24 then return nil, "verified_west_boat_dealer_out_of_range" end
+        end
+        local comm = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+        if not comm or type(comm.InvokeServer) ~= "function" then return nil, "buyboat_remote_missing" end
+        setPhase("buying_boat", selected)
+        local ok, result = pcall(function() return comm:InvokeServer("BuyBoat", selected) end)
+        if not ok then return nil, "buyboat_call_failed" end
+        local deadline = now() + 12
+        repeat
+            existing = ownedBoatByName(selected)
+            -- After a sea reset, do not bind to the stale hull that triggered
+            -- it: wait until BuyBoat has produced a different owned instance.
+            if existing and (not forceFreshBoat or existing ~= previousBoat) then
+                runtime.forceFreshBoat = false
+                return existing
+            end
+            task.wait(0.15)
+        until not isCurrent(generation) or now() >= deadline
+        return nil, (forceFreshBoat and "fresh_boat_not_spawned_" or "boat_not_spawned_") .. tostring(result)
+    end
+
+    -- When all measured Tiki exit lifts still produce insignificant forward
+    -- travel, the hull is considered stuck rather than merely too low. Return
+    -- to the verified WEST/open-sea Boat Dealer and request a genuinely new
+    -- boat instance. This intentionally never scans/selects the island-side
+    -- dealer.
+    local function buyReplacementBoatAtTikiWestDealer(generation, previousBoat)
+        local selected = State.eventFarmBoat
+        if type(selected) ~= "string" or selected == "" then return nil, "boat_not_selected" end
+        local dealer = findTikiWestDealer()
+        if not dealer or not dealer.verified then return nil, "verified_west_boat_dealer_not_found" end
+        local root = rootPart()
+        if not root then return nil, "character_missing" end
+        local dealerDistance = (root.Position - dealer.position).Magnitude
+        if dealerDistance > 18 then
+            setPhase("returning_to_verified_west_dealer")
+            local farm = Flow.Features.Farm
+            if not farm or not farm.MoveTo then return nil, "travel_to_verified_west_dealer_unavailable" end
+            local arrived = farm:MoveTo(CFrame.new(dealer.position), "sea_event_replace_stuck_boat")
+            if not arrived or not isCurrent(generation) then return nil, "could_not_reach_verified_west_dealer" end
+            root = rootPart()
+            if not root or (root.Position - dealer.position).Magnitude > 24 then
+                return nil, "verified_west_boat_dealer_out_of_range"
+            end
+        end
+        local comm = ReplicatedStorage and ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+        if not comm or type(comm.InvokeServer) ~= "function" then return nil, "buyboat_remote_missing" end
+        setPhase("rebuying_stuck_boat", selected)
+        local ok, result = pcall(function() return comm:InvokeServer("BuyBoat", selected) end)
+        if not ok then return nil, "replacement_buyboat_call_failed" end
+        local deadline = now() + 12
+        repeat
+            local replacement = ownedBoatByName(selected)
+            -- Do not bind again to the same stranded Model. BuyBoat normally
+            -- removes it and creates a new owned instance with the same name.
+            if replacement and replacement ~= previousBoat then return replacement end
+            task.wait(0.15)
+        until not isCurrent(generation) or now() >= deadline
+        return nil, "replacement_boat_not_spawned_" .. tostring(result)
+    end
+
+    local function beginExistingSeaCalibration()
+        local runtime = EventFarm.Runtime
+        local markerVisible = (tonumber(player and player:GetAttribute("DangerLevel")) or 0) > 1
+        runtime.marker.lastGood = markerVisible and runtime.lift or nil
+        runtime.marker.seenFor = 0
+        runtime.marker.missingFor = 0
+        runtime.marker.mode = markerVisible and "seek_highest" or "recover_marker"
+        setPhase("calibrating_existing_sea")
+    end
+
+    local function setOpenSeaCourse(generation)
+        local runtime = EventFarm.Runtime
+        local route = getTikiOpenSeaRoute()
+        runtime.cruiseDirection = route.direction
+        setPhase("leaving_tiki")
+        -- Start high immediately and keep that altitude throughout Tiki. The
+        -- only response to a blocked horizontal route is more lift, never a
+        -- downward retry. Descent/calibration begins only after projection
+        -- proves that the hull has left the island.
+        local lifts = {EventFarm.TikiExitFirstLift, EventFarm.TikiExitSecondLift, EventFarm.TikiExitThirdLift}
+        local lastProjection = 0
+        for attempt, requestedLift in ipairs(lifts) do
+            if not isCurrent(generation) then return false, "stopped" end
+            local liftTarget = math.max(runtime.targetLift or 0, runtime.lift or 0, requestedLift)
+            setPhase("leaving_tiki", "high_lift_" .. tostring(math.floor(liftTarget)))
+            drive(nil, 0)
+            setLift(liftTarget, 420)
+            if not waitForLift(generation, liftTarget, 12, 10) then return false, "high_lift_timeout" end
+            local seat = runtime.seat
+            local startPosition = seat and seat.Position
+            drive(route.direction, 300)
+            if not waitSeconds(generation, 3.5) then return false, "stopped" end
+            local finish = seat and seat.Position
+            lastProjection = startPosition and finish and Vector3.new(finish.X - startPosition.X, 0, finish.Z - startPosition.Z):Dot(route.direction) or 0
+            if lastProjection >= EventFarm.TikiExitMinimumProjection then
+                runtime.marker.mode = "rapid_descent"
+                runtime.marker.lastGood = nil
+                runtime.marker.seenFor = 0
+                runtime.marker.missingFor = 0
+                setPhase("calibrating_sea_marker", "outside_tiki")
+                drive(route.direction, 300)
+                return true
+            end
+            drive(nil, 0)
+            journal("tiki_obstacle_lift", {attempt = attempt, lift = liftTarget, projection = lastProjection})
+        end
+        return false, "open_sea_exit_not_confirmed_projection_" .. tostring(math.floor(lastProjection))
+    end
+
+    local function updateCruiseCalibration(dt)
+        local runtime = EventFarm.Runtime
+        -- Obstruction recovery owns lift until real forward travel resumes.
+        -- This prevents rapid_descent from cancelling the recovery climb.
+        if runtime.preStallLift ~= nil then
+            runtime.marker.mode = "stall_recovery"
+            return
+        end
+        local rawDanger = tonumber(player and player:GetAttribute("DangerLevel")) or 0
+        -- This is exactly the SeaExploration HUD enabling condition: DangerLevel > 1.
+        local markerVisible = rawDanger > 1
+        local marker = runtime.marker
+        if marker.mode == "rapid_descent" then
+            -- First leave the clearance altitude quickly. Only after reaching a
+            -- low sea-height sample do we trust the marker to seek its maximum
+            -- usable altitude again.
+            if runtime.targetLift > 80 then
+                setLift(math.max(80, runtime.targetLift - 520 * dt), 520)
+            elseif markerVisible then
+                marker.mode = "seek_highest"
+                marker.seenFor = 0
+                marker.missingFor = 0
+                marker.lastGood = runtime.lift
+                setLift(runtime.lift + 42, 220)
+            end
+        elseif marker.mode == "seek_highest" then
+            if markerVisible then
+                marker.seenFor = marker.seenFor + dt
+                marker.lastGood = runtime.lift
+                setLift(runtime.targetLift + 42 * dt, 220)
+            else
+                marker.mode = "recover_marker"
+                marker.missingFor = 0
+                setLift(math.max(0, (marker.lastGood or runtime.lift) - 35), 220)
+            end
+        elseif marker.mode == "recover_marker" then
+            if markerVisible then
+                marker.seenFor = marker.seenFor + dt
+                if marker.seenFor >= 0.5 then
+                    marker.mode = "locked"
+                    marker.lastGood = runtime.lift
+                    setLift(marker.lastGood, 100)
+                    notify("Farm Eventos", "Altura marítima calibrada pela bússola.", "success", "marker_locked", 20)
+                end
+            else
+                marker.seenFor = 0
+                setLift(math.max(0, runtime.targetLift - 12 * dt), 80)
+            end
+        elseif marker.mode == "locked" then
+            if markerVisible then
+                marker.missingFor = 0
+                setLift(marker.lastGood or runtime.targetLift, 100)
+            else
+                marker.missingFor = marker.missingFor + dt
+                if marker.missingFor > 0.8 then
+                    marker.mode = "recover_marker"
+                    marker.seenFor = 0
+                    setLift(math.max(0, (marker.lastGood or runtime.targetLift) - 10), 100)
+                end
+            end
+        end
+    end
+
+    local function updateStallRecovery(dt)
+        local runtime = EventFarm.Runtime
+        if runtime.transit and runtime.transit.active and runtime.phase == "leaving_tiki" then return end
+        local seat = runtime.seat
+        -- While a seated player is deliberately parking the hull away from a
+        -- Terror Shark, vertical obstruction recovery is forbidden. It was
+        -- the source of the recorded 2962 stud/s upward ejection.
+        if runtime.boatAwayActive then return end
+        if not seat or not runtime.direction or math.abs(runtime.speed) < 80 then return end
+        local velocity = seat.AssemblyLinearVelocity
+        local horizontal = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+        if horizontal < 35 then
+            runtime.stalledFor = runtime.stalledFor + dt
+            if runtime.stalledFor >= 0.9 then
+                if runtime.preStallLift == nil then
+                    runtime.preStallLift = runtime.targetLift
+                    runtime.stallBoost = 0
+                    notify("Farm Eventos", "Barco obstruído: assumindo altura de recuperação.", "info", "boat_stall", 8)
+                end
+                -- Rise in bounded tiers while physical movement is genuinely
+                -- blocked. The first tier clears Tiki-scale geometry; later
+                -- tiers handle taller streamed geometry without unbounded lift.
+                local tier = math.floor((runtime.stalledFor - 0.9) / 1.25)
+                local wantedBoost = math.min(1120, 420 + tier * 160)
+                local wantedLift = math.min(1200, runtime.preStallLift + wantedBoost)
+                if runtime.targetLift < wantedLift - 2 then
+                    runtime.stallBoost = wantedBoost
+                    setLift(wantedLift, 440)
+                end
+            end
+        else
+            runtime.stalledFor = 0
+            if runtime.preStallLift ~= nil then
+                setLift(runtime.preStallLift, 360)
+                runtime.preStallLift = nil
+                runtime.stallBoost = 0
+                -- Release the recovery ownership completely so regular sea
+                -- marker calibration resumes on the following cruise frame.
+                if runtime.marker.mode == "stall_recovery" then runtime.marker.mode = "rapid_descent" end
+                notify("Farm Eventos", "Rota liberada: retornando à altura marítima.", "success", "boat_unstuck", 8)
+            end
+        end
+    end
+
+    local function safeInstanceId(instance)
+        if not instance then return nil end
+        local ok, id = pcall(function() return instance:GetDebugId() end)
+        return ok and tostring(id) or tostring(instance)
+    end
+
+    local function nearbyRaidBoat(origin)
+        local enemies = Workspace and Workspace:FindFirstChild("Enemies")
+        local seat = EventFarm.Runtime.seat
+        local originPosition = origin and origin.Position or (seat and seat.Position) or (rootPart() and rootPart().Position)
+        if not enemies or not originPosition then return nil end
+        local nearest, nearestDistance
+        for _, item in ipairs(enemies:GetChildren()) do
+            local name = lower(item.Name)
+            if name == "piratebrigade" or name == "pirategrandbrigade" or name == "piratebasic" or name == "fishboat" then
+                local root = targetRoot(item)
+                local d = root and distance(originPosition, root.Position) or math.huge
+                if d < 520 and (not nearestDistance or d < nearestDistance) then nearest, nearestDistance = item, d end
+            end
+        end
+        return nearest, nearestDistance
+    end
+
+    local function driveSea(generation)
+        local runtime = EventFarm.Runtime
+        drive(runtime.cruiseDirection or EventFarm.TikiOpenSeaDirection, 300)
+        local last = now()
+        while isCurrent(generation) do
+            if runtime.boatLostReason then return nil, "boat_lost" end
+            if not isAlive() then
+                setPhase("waiting_respawn", "player_died_during_cruise")
+                repeat task.wait(0.25) until not isCurrent(generation) or isAlive()
+                return nil, isCurrent(generation) and "character_died" or "stopped"
+            end
+            local ratio, health, maximum = boatHealthRatio(runtime.boat)
+            if ratio and ratio <= 0.30 then
+                runtime.boatLostReason = "boat_health_30_percent_" .. tostring(math.floor(ratio * 100))
+                journal("boat_replacement_required", {ratio = ratio, health = health, maximum = maximum})
+                return nil, "boat_lost"
+            end
+            -- The selected event has absolute priority. A nearby raid is a
+            -- survival concern during cruise, never a reason to skip a visible
+            -- Terrorshark scan indefinitely.
+            local target = visibleTerrorShark()
+            if target then return target end
+            local raid, raidDistance = nearbyRaidBoat()
+            local raidCooldown = runtime.raidExitCooldown or 0
+            if raid and raidCooldown <= now() then
+                local raidRoot = targetRoot(raid)
+                local away = raidRoot and Vector3.new(runtime.seat.Position.X - raidRoot.Position.X, 0, runtime.seat.Position.Z - raidRoot.Position.Z)
+                if away and away.Magnitude > 0.1 then
+                    runtime.raidExitQuietSince = nil
+                    if runtime.phase ~= "evading_sea_raid" then
+                        setPhase("evading_sea_raid", raid.Name .. "_" .. tostring(math.floor(raidDistance)))
+                        journal("raid_avoid", {
+                            name = raid.Name,
+                            distance = raidDistance,
+                            instanceId = safeInstanceId(raid),
+                            raidRootPos = raidRoot and {x = raidRoot.Position.X, y = raidRoot.Position.Y, z = raidRoot.Position.Z} or nil,
+                            seatPos = runtime.seat and {x = runtime.seat.Position.X, y = runtime.seat.Position.Y, z = runtime.seat.Position.Z} or nil,
+                        })
+                    else
+                        runtime.reason = raid.Name .. "_" .. tostring(math.floor(raidDistance))
+                    end
+                    drive(away.Unit, 350)
+                    task.wait(0.1)
+                    continue
+                end
+            end
+            if runtime.phase == "evading_sea_raid" and not raid then
+                -- Require a continuous quiet window before returning to cruise;
+                -- a one-frame distance flicker must not immediately flip phase.
+                runtime.raidExitQuietSince = runtime.raidExitQuietSince or now()
+                if now() - runtime.raidExitQuietSince >= 2.0 then
+                    setPhase("sea_cruise", "raid_cleared")
+                    drive(runtime.cruiseDirection or EventFarm.TikiOpenSeaDirection, 300)
+                    runtime.raidExitCooldown = now() + 1.5
+                    runtime.raidExitQuietSince = nil
+                end
+            elseif runtime.phase ~= "evading_sea_raid" then
+                runtime.raidExitQuietSince = nil
+            end
+            local at = now()
+            local dt = math.max(0.01, at - last)
+            last = at
+            updateCruiseCalibration(dt)
+            updateStallRecovery(dt)
+            task.wait(0.1)
+        end
+        return nil, runtime.boatLostReason and "boat_lost" or "stopped"
+    end
+
+    local function ensureLocalDriver(generation)
+        local runtime = EventFarm.Runtime
+        local seat = runtime.seat
+        if not seat or not seat.Parent then return false, "boat_seat_missing" end
+        if localOccupies(seat) then return true end
+        if otherPlayerDrives(seat) then return false, "other_player_drives_boat" end
+        local h = humanoid()
+        if not h then return false, "character_missing" end
+        pcall(function() seat:Sit(h) end)
+        local deadline = now() + 2
+        repeat task.wait(0.05) until not isCurrent(generation) or runtime.boatLostReason or localOccupies(seat) or now() >= deadline
+        if runtime.boatLostReason then return false, "boat_lost" end
+        return localOccupies(seat), localOccupies(seat) and nil or "could_not_remain_in_boat"
+    end
+
+    local function driveBoatAway(generation, target, approachNotice)
+        local runtime = EventFarm.Runtime
+        if not State.eventFarmMoveBoatAway then return true, "move_away_disabled" end
+        if not isTerrorSharkTargetValid(target) then return false, "target_out_of_range" end
+        local seated, seatReason = ensureLocalDriver(generation)
+        if not seated then return false, seatReason end
+        local root = targetRoot(target)
+        local seat = runtime.seat
+        if not root or not seat then return false, "boat_or_target_missing" end
+        runtime.boatAwayActive = true
+        runtime.boatSafeTarget = nil
+        runtime.awayProgressCheck = nil
+        local function abort(reason, fields)
+            drive(nil, 0)
+            runtime.boatAwayActive = false
+            runtime.awayProgressCheck = nil
+            fields = fields or {}
+            fields.reason = reason
+            journal("boat_away_abort", fields)
+            return false, reason
+        end
+        local function lockSafeDistance()
+            drive(nil, 0)
+            local untilAt = now() + EventFarm.BoatSafeStableSeconds
+            while isCurrent(generation) and now() < untilAt do
+                if runtime.boatLostReason then return abort("boat_lost") end
+                if not targetAlive(target) then return abort("target_gone") end
+                root = targetRoot(target)
+                if not root or not root.Parent then return abort("target_root_missing") end
+                if not localOccupies(seat) then return abort("left_boat_before_safe_distance") end
+                local separationNow = distance(seat.Position, root.Position)
+                local vertical = math.abs(seat.AssemblyLinearVelocity.Y)
+                if separationNow < EventFarm.BoatSafeDistance or vertical > EventFarm.BoatVerticalSafetySpeed then
+                    return abort("boat_distance_or_vertical_motion_unstable")
+                end
+                task.wait(0.05)
+            end
+            if not isCurrent(generation) then return abort("stopped") end
+            runtime.boatSafeTarget = target
+            runtime.boatSafeAt = now()
+            runtime.boatAwayActive = false
+            runtime.awayProgressCheck = nil
+            -- v1.6.4 diagnostic only: record the actual seat/target altitude
+            -- when the boat-away guard finishes; runtime.lift alone is a control
+            -- value and is not assumed to equal physical Seat Y.
+            journal("boat_away_lift_check", {
+                finalLift = runtime.lift,
+                targetLift = runtime.targetLift,
+                seatY = seat and seat.Position.Y or nil,
+                sharkY = root and root.Position.Y or nil,
+                verticalSeparation = seat and root and (seat.Position.Y - root.Position.Y) or nil,
+            })
+            return true, "safe_distance_stable"
+        end
+        local separation = distance(seat.Position, root.Position)
+        journal("boat_away_start", {target = target.Name, distance = separation})
+        if separation >= EventFarm.BoatSafeDistance then
+            local ok, reason = lockSafeDistance()
+            if ok then journal("boat_away_success", {distance = separation}) end
+            return ok, reason
+        end
+        local away = Vector3.new(seat.Position.X-root.Position.X,0,seat.Position.Z-root.Position.Z)
+        if away.Magnitude < .1 then away=EventFarm.TikiOpenSeaDirection end
+        notify("Farm Eventos",approachNotice or "Terror Shark encontrado: permanecendo no barco e criando distância segura.","info","boat_away",1)
+        setPhase("moving_boat_away")
+        drive(away.Unit,300)
+        local started=seat.Position;local deadline=now()+EventFarm.BoatAwayTimeout
+        local lastProgressAt = 0
+        while isCurrent(generation) and now()<deadline do
+            if runtime.boatLostReason then return abort("boat_lost") end
+            if not targetAlive(target) then return abort("target_gone") end
+            root = targetRoot(target)
+            if not root or not root.Parent then return abort("target_root_missing") end
+            if not localOccupies(seat) then return abort("left_boat_before_safe_distance") end
+            local liveAway = Vector3.new(seat.Position.X - root.Position.X, 0, seat.Position.Z - root.Position.Z)
+            if liveAway.Magnitude > 0.1 then drive(liveAway.Unit, 300) end
+            separation=distance(seat.Position,root.Position)
+            if not runtime.awayProgressCheck then
+                runtime.awayProgressCheck = {first = separation, firstAt = now()}
+            end
+            if now() - runtime.awayProgressCheck.firstAt >= 3 then
+                local gained = separation - runtime.awayProgressCheck.first
+                if gained < 150 then
+                    return abort("shark_following", {gained = gained})
+                end
+                runtime.awayProgressCheck = {first = separation, firstAt = now()}
+            end
+            if now() - lastProgressAt >= 0.75 then
+                lastProgressAt = now()
+                journal("boat_away_progress", {distance = separation, travelled = distance(seat.Position, started)})
+            end
+            if separation>=EventFarm.BoatSafeDistance and distance(seat.Position,started)>=math.max(80,EventFarm.BoatAwayMinimumTravel) then
+                local ok, reason = lockSafeDistance()
+                if ok then journal("boat_away_success", {distance = separation}) end
+                return ok, reason
+            end
+            task.wait(.1)
+        end
+        runtime.targetBackoff[target]=now()+8
+        return abort("safe_distance_not_reached")
+    end
+
+    local function journalAttack(kind, fields)
+        local runtime = EventFarm.Runtime
+        runtime.attackJournalAt = runtime.attackJournalAt or {}
+        local key = kind .. "|" .. tostring(fields and fields.reason or "")
+        if now() - (runtime.attackJournalAt[key] or -math.huge) < 2 then return end
+        runtime.attackJournalAt[key] = now()
+        journal(kind, fields)
+    end
+
+    local function attackTerrorShark(target)
+        local runtime = EventFarm.Runtime
+        runtime.attackCallCount = (runtime.attackCallCount or 0) + 1
+
+        local function logAttackStats()
+            if not runtime.lastAttackStatsLog or now() - runtime.lastAttackStatsLog > 1.0 then
+                runtime.lastAttackStatsLog = now()
+                journal("attack_stats", {
+                    callsTotal = runtime.attackCallCount or 0,
+                    acceptedTotal = runtime.attackAcceptedCount or 0,
+                    refusedTotal = runtime.attackRefusedCount or 0,
+                    cooldownTotal = runtime.attackCooldownCount or 0,
+                    outOfRangeTotal = runtime.attackRangeCount or 0,
+                })
+            end
+        end
+
+        local farm = Flow.Features.Farm
+        -- v1.6.2 diagnostic: prove the phase, direct Root distance and hover
+        -- owner at every EventFarm attack attempt before FIX-18 corrects hover.
+        local pRoot, sRoot = rootPart(), targetRoot(target)
+        local farmState = farm and farm.State
+        journal("attack_attempt", {
+            phase = EventFarm.Runtime.phase,
+            sharkDist = pRoot and sRoot and (pRoot.Position - sRoot.Position).Magnitude or -1,
+            hoverOwner = farmState and farmState.hoverOwner,
+        })
+        -- v1.6.0 FIX-18: make the dynamic combat-follow provider apply the
+        -- current Shark-relative anchor immediately before the range check.
+        if farm and type(farm.ApplyHover) == "function" then
+            pcall(function() farm:ApplyHover(true) end)
+        end
+        if not farm or type(farm.Attack) ~= "function" then
+            runtime.attackRefusedCount = (runtime.attackRefusedCount or 0) + 1
+            logAttackStats()
+            journalAttack("attack_refused", {reason = "farm_attack_missing"})
+            return false, "farm_attack_missing"
+        end
+        -- v1.6.5 FIX-22/FIX-23: the Terrorshark Humanoid's Health does not
+        -- provide reliable local damage feedback. Scope the rejection bypass to
+        -- this exact EventFarm call and use the explicitly requested 130-stud
+        -- combat hit range; normal Farm attacks retain their default behavior.
+        farm.State.skipRejectedTargetForSeaBeast = true
+        local invoked, accepted, reason = pcall(function()
+            return farm:Attack(target, {range = 130})
+        end)
+        farm.State.skipRejectedTargetForSeaBeast = false
+        if not invoked then
+            runtime.attackRefusedCount = (runtime.attackRefusedCount or 0) + 1
+            logAttackStats()
+            journalAttack("attack_error", {reason = tostring(accepted)})
+            return false, tostring(accepted)
+        end
+        if accepted ~= true then
+            runtime.attackRefusedCount = (runtime.attackRefusedCount or 0) + 1
+            if reason == "target_out_of_range" then
+                runtime.attackRangeCount = (runtime.attackRangeCount or 0) + 1
+                -- Farm owns model enumeration while EventFarm owns this journal.
+                -- Copy only primitive diagnostic data prepared by Farm:Attack.
+                local rangeDebug = farm and farm.State and farm.State.lastAttackRangeDebug
+                if type(rangeDebug) == "table" then journal("attack_range_debug", rangeDebug) end
+            end
+            logAttackStats()
+            journalAttack("attack_refused", {reason = tostring(reason or "attack_rejected")})
+            return false, reason
+        end
+        if reason == "attacked" then
+            runtime.attackAcceptedCount = (runtime.attackAcceptedCount or 0) + 1
+            journalAttack("attack_accepted", {reason = reason})
+        elseif reason == "cooldown" then
+            runtime.attackCooldownCount = (runtime.attackCooldownCount or 0) + 1
+        else
+            journalAttack("attack_result", {reason = tostring(reason)})
+        end
+        logAttackStats()
+        return true, reason
+    end
+
+    local function returnToBoat(generation, reason)
+        local runtime = EventFarm.Runtime
+        local seat = runtime.seat
+        if not seat or not seat.Parent then return false, "boat_missing" end
+        local playerRoot = rootPart()
+        local boatDistance = playerRoot and distance(playerRoot.Position, seat.Position) or math.huge
+        if boatDistance > EventFarm.BoatFarReplacementDistance then
+            runtime.boatLostReason = "boat_too_far_" .. tostring(math.floor(boatDistance))
+            journal("boat_abandoned", {reason = reason, distance = boatDistance})
+            return false, runtime.boatLostReason
+        end
+        setPhase("returning_to_boat", reason)
+        endExternalCombat()
+        local teleport = Flow.Features.Teleport
+        if not teleport or not teleport.TravelDirectToPosition then return false, "direct_travel_unavailable" end
+        local moved, travelReason = teleport:TravelDirectToPosition(seat.Position + Vector3.new(0, 12, 0), "sea_event_return", "Event boat", {
+            holdArrivalVelocity = true, arrivalConfirmSeconds = 0.35, maxAttempts = 2,
+        })
+        if not moved then return false, "return_direct_failed_" .. tostring(travelReason) end
+        local h = humanoid()
+        if h then pcall(function() seat:Sit(h) end) end
+        local deadline = now() + 3
+        repeat task.wait(0.05) until not isCurrent(generation) or localOccupies(seat) or now() >= deadline
+        return localOccupies(seat), localOccupies(seat) and nil or "could_not_reenter_boat"
+    end
+
+    local function startCombat(generation, target)
+        local function gate(kind, passed, fields)
+            fields = fields or {}
+            fields.passed = passed == true
+            journal(kind, fields)
+            return passed == true
+        end
+        if not gate("combat_gate_generation", isCurrent(generation), {generation = generation}) then return false, "generation_changed" end
+        local runtime = EventFarm.Runtime
+        local targetValid = isTerrorSharkTargetValid(target)
+        if not gate("combat_gate_target_valid", targetValid, {target = target and target.Name}) then return false, "target_out_of_range" end
+        local root = targetRoot(target)
+        local characterRoot = rootPart()
+        if not gate("combat_gate_roots", root ~= nil and characterRoot ~= nil, {targetRoot = root and root.Name, playerRoot = characterRoot and characterRoot.Name}) then
+            return false, "terror_shark_or_character_root_missing"
+        end
+        local startDistance = distance(characterRoot.Position, root.Position)
+        if not gate("combat_gate_distance_3000", startDistance <= EventFarm.TerrorSharkMaxCombatStartDistance, {distance = startDistance, limit = EventFarm.TerrorSharkMaxCombatStartDistance}) then
+            runtime.targetBackoff[target] = now() + 8
+            return false, "combat_target_too_distant"
+        end
+        if State.eventFarmMoveBoatAway and runtime.boatSafeTarget == target then
+            local boatPosition, seat = runtime.seat and runtime.seat.Position, runtime.seat
+            local boatSafe = boatPosition ~= nil and localOccupies(seat)
+                and distance(boatPosition, root.Position) >= EventFarm.BoatSafeDistance
+            if not gate("combat_gate_boat_safe", boatSafe, {boatSafeTarget = runtime.boatSafeTarget and runtime.boatSafeTarget.Name, distance = boatPosition and distance(boatPosition, root.Position), limit = EventFarm.BoatSafeDistance, seated = localOccupies(seat)}) then
+                return false, "boat_not_at_safe_distance"
+            end
+        elseif State.eventFarmMoveBoatAway and runtime.boatAwayFallbackTarget == target then
+            journal("combat_gate_boat_safe", {passed = true, bypass = "boat_away_failed_fallback"})
+        elseif State.eventFarmMoveBoatAway then
+            journal("combat_gate_boat_safe", {passed = false, boatSafeTarget = runtime.boatSafeTarget and runtime.boatSafeTarget.Name, fallbackTarget = runtime.boatAwayFallbackTarget and runtime.boatAwayFallbackTarget.Name})
+            return false, "boat_not_at_safe_distance"
+        else
+            journal("combat_gate_boat_safe", {passed = true, bypass = "move_boat_away_disabled"})
+        end
+        local farm, teleport = Flow.Features.Farm, Flow.Features.Teleport
+        local modulesReady = farm and type(farm.BeginExternalFollow) == "function" and teleport and type(teleport.TravelDirectToPosition) == "function"
+        if not gate("combat_gate_modules_ready", modulesReady, {farm = farm ~= nil, directTravel = teleport and type(teleport.TravelDirectToPosition) == "function"}) then return false, "combat_modules_missing" end
+        journal("combat_handoff_enter", {target = target.Name})
+        setPhase("disembarking_for_combat")
+        local h = humanoid()
+        local seat = runtime.seat
+        local playerRoot = rootPart()
+        -- v1.6.4 diagnostics only. They do not alter the seat, Humanoid, hover,
+        -- lift, or travel state; they establish whether a low physical boat
+        -- position or an inherited mover is present at the precise handoff.
+        journal("dismount_altitude_check", {
+            seatY = seat and seat.Position.Y or nil,
+            playerY = playerRoot and playerRoot.Position.Y or nil,
+            sharkY = root and root.Position.Y or nil,
+            boatLift = runtime.lift,
+            targetLift = runtime.targetLift,
+            waterLevelEstimate = 0,
+            humanoidState = humanoidStateName(h),
+            seated = localOccupies(seat),
+        })
+        local farmState = farm and farm.State
+        journal("dismount_physics_check", {
+            playerBV = playerRoot and playerRoot:FindFirstChild("BodyVelocity") ~= nil or false,
+            playerBP = playerRoot and playerRoot:FindFirstChild("BodyPosition") ~= nil or false,
+            hoverOwner = farmState and farmState.hoverOwner or nil,
+            hoverConnection = farmState and farmState.hoverConnection ~= nil or false,
+            humanoidState = humanoidStateName(h),
+        })
+        journal("combat_dismount_attempt", {seated = localOccupies(seat), humanoidState = humanoidStateName(h)})
+        -- Temporarily prevent the VehicleSeat from re-engaging the Humanoid
+        -- while the outbound direct travel is about to begin.
+        local originalCanTouch = seat and seat.CanTouch
+        local originalDisabled = seat and seat.Disabled
+        if seat then
+            pcall(function() seat.Disabled = true end)
+            pcall(function() seat.CanTouch = false end)
+        end
+        if h then pcall(function() h.Sit = false end) end
+        local leaveDeadline, stableSince = now() + 1.2, nil
+        repeat
+            task.wait(0.05)
+            local freeNow = not localOccupies(seat)
+            local notSitting = h and h.Sit == false
+            if freeNow and notSitting then
+                if not stableSince then stableSince = now()
+                elseif now() - stableSince >= 0.15 then break end
+            else
+                stableSince = nil
+            end
+        until not isCurrent(generation) or now() >= leaveDeadline
+        -- Restore the native seat exactly before normal combat/travel control.
+        if seat then
+            pcall(function() seat.Disabled = originalDisabled or false end)
+            pcall(function() seat.CanTouch = originalCanTouch ~= false end)
+        end
+        if not isCurrent(generation) then return false, "generation_changed" end
+        local dismounted = not localOccupies(seat) and h and h.Sit == false
+        journal("combat_dismount_success", {
+            passed = dismounted,
+            stableFor = stableSince and now() - stableSince or 0,
+            humanoidState = humanoidStateName(h),
+            playerY = rootPart() and rootPart().Position.Y or nil,
+            seatY = seat and seat.Position.Y or nil,
+        })
+        if not dismounted then return false, "could_not_disembark" end
+        root = targetRoot(target)
+        if not root or not targetAlive(target) then
+            journal("combat_gate_target_before_travel", {passed = false, root = root and root.Name})
+            return false, "target_lost_before_direct_travel"
+        end
+        -- A second guard catches any seat re-occupation after the protected
+        -- dismount window but before the outbound route acquires its ticket.
+        if localOccupies(runtime.seat) then
+            journal("combat_gate_target_before_travel", {passed = false, reason = "reoccupied_seat"})
+            return false, "dismount_reverted_before_travel"
+        end
+        journal("combat_gate_target_before_travel", {passed = true, root = root.Name})
+        local playerRoot = rootPart()
+        local offset = playerRoot and Vector3.new(playerRoot.Position.X - root.Position.X, 0, playerRoot.Position.Z - root.Position.Z) or Vector3.new(0, 0, 1)
+        if offset.Magnitude < 1 then offset = Vector3.new(0, 0, 1) end
+        runtime.combatOffset = offset.Unit * EventFarm.TerrorSharkCombatLateralOffset
+        local destination = root.Position + runtime.combatOffset + Vector3.new(0, EventFarm.TerrorSharkCombatHeight, 0)
+        local targetStartPosition = root.Position
+        local travelStartedAt = now()
+        local confirmWindows = {}
+        local sampling = {active = true, sequence = 0}
+
+        local function hostileShipFields(playerRoot)
+            local ship, shipDistance = nearbyRaidBoat(playerRoot)
+            local shipRoot = ship and targetRoot(ship)
+            if not ship then return nil end
+            return {
+                ship_name = ship.Name,
+                ship_pos = shipRoot and vectorSnapshot(shipRoot.Position) or nil,
+                distance = shipDistance,
+                script_phase = EventFarm.Runtime.phase,
+                script_action = "continue_diagnostic_only",
+            }
+        end
+
+        local function sampleCombatTravel(stage)
+            local currentRoot = rootPart()
+            local currentTargetRoot = targetRoot(target)
+            local h = humanoid()
+            sampling.sequence = sampling.sequence + 1
+            journal("combat_travel_sample", {
+                sequence = sampling.sequence,
+                stage = stage,
+                elapsed = now() - travelStartedAt,
+                client_pos = currentRoot and vectorSnapshot(currentRoot.Position) or nil,
+                requested_destination = vectorSnapshot(destination),
+                target_pos = currentTargetRoot and vectorSnapshot(currentTargetRoot.Position) or nil,
+                target_vel = currentTargetRoot and vectorSnapshot(currentTargetRoot.AssemblyLinearVelocity) or nil,
+                delta_client_destination = currentRoot and distance(currentRoot.Position, destination) or nil,
+                delta_client_target = currentRoot and currentTargetRoot and distance(currentRoot.Position, currentTargetRoot.Position) or nil,
+                velocity = currentRoot and vectorSnapshot(currentRoot.AssemblyLinearVelocity) or nil,
+                humanoid_state = humanoidStateName(h),
+                localOccupiesSeat = runtime.seat and localOccupies(runtime.seat) or false,
+            })
+            local shipFields = hostileShipFields(currentRoot)
+            if shipFields then journal("hostile_ship_detected", shipFields) end
+        end
+
+        -- v1.6.2 diagnostic: EventFarm itself has not started combat follow
+        -- at this point; export any residual Farm hover before direct travel.
+        local farmState = Flow.Features.Farm.State
+        journal("pre_travel_hover_check", {
+            hoverOwner = farmState.hoverOwner,
+            hoverActive = farmState.hoverConnection ~= nil,
+            correctionInterval = Flow.Features.Farm.HoverCorrectionInterval,
+        })
+        setPhase("combat_travel_direct")
+        sampleCombatTravel("start")
+        task.spawn(function()
+            while sampling.active and isCurrent(generation) and EventFarm.Runtime.phase == "combat_travel_direct" do
+                task.wait(0.10)
+                if sampling.active and isCurrent(generation) and EventFarm.Runtime.phase == "combat_travel_direct" then
+                    sampleCombatTravel("interval")
+                end
+            end
+        end)
+        local moved, travelReason = teleport:TravelDirectToPosition(destination, "sea_event_combat", "Terror Shark", {
+            holdArrivalVelocity = true, arrivalConfirmSeconds = 0.35, maxAttempts = 2,
+            arrivalDiagnostics = {
+                onConfirmStart = function(data)
+                    confirmWindows[data.attempt or #confirmWindows + 1] = {
+                        attempt = data.attempt,
+                        observationSeconds = data.observationSeconds,
+                        playerRootVelocityAtConfirm = data.root and vectorSnapshot(data.root.AssemblyLinearVelocity) or nil,
+                        humanoidStateAtConfirm = humanoidStateName(data.humanoid),
+                    }
+                end,
+                onConfirmEnd = function(data)
+                    local row = confirmWindows[data.attempt or #confirmWindows + 1] or {}
+                    row.attempt = data.attempt
+                    row.observationSeconds = data.observationSeconds
+                    row.arrivalConfirmWindowFrames = data.frames
+                    row.largestObservedPlayerStep = data.largestStep
+                    row.confirmed = data.confirmed
+                    row.finalDestinationDelta = data.distance
+                    row.playerRootVelocityAtEnd = data.root and vectorSnapshot(data.root.AssemblyLinearVelocity) or nil
+                    row.humanoidStateAtEnd = humanoidStateName(data.humanoid)
+                    confirmWindows[data.attempt or #confirmWindows + 1] = row
+                end,
+            },
+        })
+        sampling.active = false
+        sampleCombatTravel("end")
+        local currentRoot, currentTargetRoot = rootPart(), targetRoot(target)
+        local lastWindow = confirmWindows[#confirmWindows]
+        journal("combat_travel_outcome", {
+            passed = moved == true,
+            reason = travelReason,
+            elapsed = now() - travelStartedAt,
+            requested_destination = vectorSnapshot(destination),
+            final_player_pos = currentRoot and vectorSnapshot(currentRoot.Position) or nil,
+            final_target_pos = currentTargetRoot and vectorSnapshot(currentTargetRoot.Position) or nil,
+            final_destination_delta = currentRoot and distance(currentRoot.Position, destination) or nil,
+            final_target_delta = currentRoot and currentTargetRoot and distance(currentRoot.Position, currentTargetRoot.Position) or nil,
+            target_displacement_since_start = currentTargetRoot and distance(currentTargetRoot.Position, targetStartPosition) or nil,
+            arrivalConfirmWindowFrames = lastWindow and lastWindow.arrivalConfirmWindowFrames or 0,
+            playerRootVelocityAtConfirm = lastWindow and lastWindow.playerRootVelocityAtConfirm or nil,
+            playerRootVelocityAtEnd = lastWindow and lastWindow.playerRootVelocityAtEnd or nil,
+            humanoidStateAtConfirm = lastWindow and lastWindow.humanoidStateAtConfirm or nil,
+            humanoidStateAtEnd = lastWindow and lastWindow.humanoidStateAtEnd or nil,
+            arrivalConfirmWindows = confirmWindows,
+        })
+        journal("combat_travel_return", {passed = moved == true, reason = travelReason})
+        if not moved then return false, "combat_direct_failed_" .. tostring(travelReason) end
+        if not isCurrent(generation) or not targetAlive(target) then return false, "target_lost_after_direct_travel" end
+        root = targetRoot(target)
+        local arrivalDistance = root and rootPart() and distance(rootPart().Position, root.Position) or math.huge
+        journal("combat_arrival_distance", {distance = arrivalDistance, limit = 180, passed = arrivalDistance <= 180})
+        if not root or not rootPart() or arrivalDistance > 180 then return false, "combat_direct_arrival_unconfirmed" end
+        local followStarted = combatFollow(target)
+        if not followStarted then return false, "combat_follow_not_started" end
+        setPhase("combat", "direct_arrival_confirmed")
+        journal("combat_ready", {target = target.Name, distance = arrivalDistance})
+        -- v1.6.0 FIX-13: Travel confirms its static destination, while a live
+        -- Shark can have moved substantially during the route. BeginExternalFollow
+        -- above already owns the provider; force two target-relative samples before
+        -- the first Farm range check when the post-travel gap exceeds hit range.
+        if arrivalDistance > 80 then
+            journal("combat_reanchor", {initialDistance = arrivalDistance, limit = 80})
+            if farm and type(farm.ApplyHover) == "function" then
+                pcall(function() farm:ApplyHover(true) end)
+                task.wait(0.05)
+                pcall(function() farm:ApplyHover(true) end)
+            end
+        end
+        if not Flow.State.farmAutoAttack then
+            Flow.State.farmAutoAttack = true
+            journal("combat_forced_auto_attack", {reason = "was_disabled"})
+            notify("Farm Eventos", "Auto Attack estava desligado; ligado automaticamente para o combate.", "warning", "auto_attack_forced", 3)
+        end
+        attackTerrorShark(target)
+        return true
+    end
+
+    local function consumeExternalVortexSignal()
+        local detector = (getgenv and getgenv() or _G).FlowKanTerrorsharkPatternDetector
+        if type(detector) ~= "table" or type(detector.GetSnapshot) ~= "function" then return nil end
+        local ok, snapshot = pcall(function() return detector:GetSnapshot() end)
+        local observations = ok and snapshot and snapshot.observations
+        local newest = observations and observations[#observations]
+        if not newest or newest.type ~= "vortex" then return nil end
+        local observedAt = (tonumber(detector.StartedAt) or 0) + (tonumber(newest.observedAt) or 0)
+        if observedAt <= 0 or now() - observedAt > 0.9 then return nil end
+        return {at = observedAt, source = newest.source or "external_pattern_detector", instance = newest}
+    end
+
+    local function tryVortexEvade(generation, target)
+        if not State.eventFarmVortexEvade then return false end
+        local runtime = EventFarm.Runtime
+        local activeAnimation, track = terrorDangerAnimation(target)
+        local signal = runtime.vortexSignal
+        if not signal or now() - signal.at > 0.9 then signal = consumeExternalVortexSignal() end
+        if activeAnimation then signal = signal or {at = now(), source = "animation_14977820392", instance = track} end
+        if not signal then return false end
+        if runtime.evadeActive then return true end
+        local root, terrorRoot = rootPart(), targetRoot(target)
+        if not root or not terrorRoot or distance(root.Position, terrorRoot.Position) > EventFarm.TerrorSharkVortexResponseRange then return false end
+        runtime.lastVortexObservation = signal.instance
+        runtime.vortexSignal = nil
+        runtime.evadeActive = true
+        runtime.emergencyUntil = now() + 1.2
+        setPhase("evading_vortex_test6", signal.source)
+        endExternalCombat()
+        destroyVortexLift()
+        -- Extracted Test 6 behavior: keep an elevated, target-relative posture
+        -- while the specific danger animation/Vortex is active, rather than
+        -- relying on one short impulse with a fixed return time.
+        local farm = Flow.Features.Farm
+        if farm and farm.BeginExternalFollow then
+            farm:BeginExternalFollow("sea_event_vortex_evade", terrorRoot.Position + EventFarm.TerrorSharkEvadeOffset, function()
+                local current = targetRoot(target)
+                return current and (current.Position + EventFarm.TerrorSharkEvadeOffset) or nil
+            end, function() return EventFarm.Runtime.active and EventFarm.Runtime.evadeActive and targetAlive(target) end, 30)
+        end
+        journal("evade_enter", {source = signal.source, target = target.Name})
+        notify("Farm Eventos", "Terror Shark: evasão Teste 6 sustentada ativada.", "warning", "vortex_evade_test6", 1)
+        local lastActive = now()
+        local timeout = now() + 4
+        while isCurrent(generation) and targetAlive(target) and now() < timeout do
+            local playing = terrorDangerAnimation(target)
+            if playing then lastActive = now() end
+            if now() - lastActive >= EventFarm.TerrorSharkEvadeGrace then break end
+            task.wait(0.05)
+        end
+        runtime.evadeActive = false
+        local f = Flow.Features.Farm
+        if f and f.EndExternalHover then pcall(function() f:EndExternalHover("sea_event_vortex_evade") end) end
+        if isCurrent(generation) and targetAlive(target) then combatFollow(target); setPhase("combat", "evade_complete") end
+        journal("evade_exit", {target = target.Name})
+        return true
+    end
+
+    local function fightTerrorShark(generation, target)
+        local runtime = EventFarm.Runtime
+        if not isTerrorSharkTargetValid(target) then return "target_out_of_range" end
+        runtime.target = target
+        runtime.boatSafeTarget = nil
+        runtime.boatAwayFallbackTarget = nil
+        runtime.deferBoatLossUntilTargetDefeated = false
+        runtime.combatBoatLossReason = nil
+        setPhase("terror_shark_found")
+        local moved, moveReason = driveBoatAway(generation, target, "Terror Shark encontrado: afastando o barco antes de sair do assento.")
+        if not moved then
+            if runtime.boatLostReason or not isCurrent(generation) or not targetAlive(target) then return "boat_lost" end
+            runtime.boatAwayFallbackTarget = target
+            journal("boat_away_failed_engaging_anyway", {reason = moveReason})
+        else
+            if runtime.boatLostReason or not isCurrent(generation) or not targetAlive(target) then return "boat_lost" end
+        end
+        local ok, reason = startCombat(generation, target)
+        if not ok then
+            runtime.targetBackoff[target] = now() + 6
+            runtime.target = nil
+            runtime.boatAwayFallbackTarget = nil
+            journal("terror_released", {reason = reason})
+            local returned, returnReason = returnToBoat(generation, "combat_start_failed")
+            if not returned and runtime.boatLostReason then return "boat_lost" end
+            setPhase("sea_cruise", "combat_guard_" .. tostring(reason) .. "_" .. tostring(returnReason or "returned"))
+            notify("Farm Eventos", "Combate não iniciou: " .. tostring(reason), "warning", "combat_guard", 2)
+            return reason
+        end
+        local combatStartTime = now()
+        runtime.lastDamageLog = nil
+        local lastAttack, lastCloseBoat = 0, 0
+        while isCurrent(generation) and targetAlive(target) do
+            -- Cruise already treats a hull at or below 30% as a lost boat. Apply
+            -- the same detection during combat, but defer its reset until this
+            -- particular Terror Shark is terminal.
+            if not runtime.boatLostReason then
+                local boatRatio, boatHealth, boatMaximum = boatHealthRatio(runtime.boat)
+                if boatRatio and boatRatio <= 0.30 then
+                    runtime.boatLostReason = "boat_health_30_percent_" .. tostring(math.floor(boatRatio * 100))
+                    journal("combat_boat_health_loss_detected", {
+                        ratio = boatRatio,
+                        health = boatHealth,
+                        maximum = boatMaximum,
+                        target = target.Name,
+                    })
+                end
+            end
+            if runtime.boatLostReason and not runtime.deferBoatLossUntilTargetDefeated then
+                -- The target is already in an active combat loop. Do not kill or
+                -- restart the player merely because the parked hull disappeared;
+                -- stop all boat-only work and finish this specific Shark fight.
+                runtime.deferBoatLossUntilTargetDefeated = true
+                runtime.combatBoatLossReason = runtime.boatLostReason
+                runtime.boatAwayActive = false
+                runtime.boatSafeTarget = nil
+                runtime.boatAwayFallbackTarget = nil
+                runtime.awayProgressCheck = nil
+                runtime.direction = nil
+                runtime.speed = 0
+                journal("combat_boat_loss_deferred", {
+                    reason = runtime.combatBoatLossReason,
+                    target = target.Name,
+                })
+                notify("Farm Eventos", "Barco perdido durante o combate; finalizando este Terror Shark antes de repor o barco.", "warning", "combat_boat_loss_deferred", 2)
+            end
+            local human = humanoid()
+            local state = human and human:GetState()
+            local damagePlayerRoot = rootPart()
+            local damageSharkRoot = targetRoot(target)
+            -- v1.6.5 FIX-24: passive injury telemetry only. It neither changes
+            -- humanoid state nor writes movement/health values.
+            if not runtime.lastDamageLog or now() - runtime.lastDamageLog > 0.5 then
+                runtime.lastDamageLog = now()
+                journal("combat_damage_sample", {
+                    playerHP = human and human.Health or nil,
+                    playerMaxHP = human and human.MaxHealth or nil,
+                    playerPos = damagePlayerRoot and {damagePlayerRoot.Position.X, damagePlayerRoot.Position.Y, damagePlayerRoot.Position.Z} or nil,
+                    sharkPos = damageSharkRoot and {damageSharkRoot.Position.X, damageSharkRoot.Position.Y, damageSharkRoot.Position.Z} or nil,
+                    dist = damagePlayerRoot and damageSharkRoot and (damagePlayerRoot.Position - damageSharkRoot.Position).Magnitude or -1,
+                })
+            end
+            local closeThreat = damageSharkRoot and damagePlayerRoot and distance(damageSharkRoot.Position, damagePlayerRoot.Position) or math.huge
+            local graceActive = now() - combatStartTime < 0.5
+            local isFalling = state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Swimming
+            -- v1.6.0 FIX-14: bounded, raw positional trace for the live
+            -- follow/range relationship. This is diagnostics only.
+            if not runtime.lastCombatPosLog or now() - runtime.lastCombatPosLog > 0.5 then
+                runtime.lastCombatPosLog = now()
+                local pRoot = rootPart()
+                local sRoot = targetRoot(target)
+                if pRoot and sRoot then
+                    local h = humanoid()
+                    journal("combat_pos_sample", {
+                        playerPos = {pRoot.Position.X, pRoot.Position.Y, pRoot.Position.Z},
+                        sharkPos = {sRoot.Position.X, sRoot.Position.Y, sRoot.Position.Z},
+                        dist = (pRoot.Position - sRoot.Position).Magnitude,
+                        state = h and h:GetState().Name,
+                    })
+                end
+            end
+            local farm = Flow.Features.Farm
+            if farm and farm.State and (not runtime.lastHoverStatsLog or now() - runtime.lastHoverStatsLog > 1.0) then
+                runtime.lastHoverStatsLog = now()
+                local farmState = farm.State
+                journal("hover_stats", {
+                    attempts = farmState.hoverAttemptCount or 0,
+                    corrections = farmState.hoverCorrectionCount or 0,
+                    providerFails = farmState.hoverProviderFailCount or 0,
+                    lastHorizontal = farmState.hoverLastHorizontal,
+                    hoverOwner = farmState.hoverOwner,
+                })
+            end
+            local hoverActive = farm and type(farm.IsHoverActive) == "function" and farm:IsHoverActive("sea_event_farm")
+            if not graceActive and not hoverActive and isFalling and closeThreat <= EventFarm.TerrorSharkEmergencyRange then
+                endExternalCombat()
+                destroyVortexLift()
+                runtime.targetBackoff[target] = now() + 12
+                runtime.target = nil
+                setPhase("emergency_water_escape", tostring(state.Name))
+                return "emergency_water_escape"
+            end
+            if not isAlive() then
+                endExternalCombat()
+                destroyVortexLift()
+                setPhase("waiting_respawn")
+                repeat task.wait(0.25) until not isCurrent(generation) or isAlive()
+                if isCurrent(generation) then
+                    runtime.target = nil
+                    return "character_died"
+                end
+                return "stopped"
+            end
+            if tryVortexEvade(generation, target) then lastAttack = now() end
+            if now() - lastAttack > 0.18 then
+                attackTerrorShark(target)
+                lastAttack = now()
+            end
+            -- The boat is recalled only after it had been parked safely and the
+            -- shark later closes back in. This is a deliberate re-park cycle,
+            -- not a rapid enter/exit oscillation.
+            local root = targetRoot(target)
+            local boatPosition = runtime.seat and runtime.seat.Position
+            local sharkDistFromBoat = root and boatPosition and distance(root.Position, boatPosition) or math.huge
+            local lastCloseBoatAgo = now() - lastCloseBoat
+            if State.eventFarmMoveBoatAway and not runtime.deferBoatLossUntilTargetDefeated
+                and root and boatPosition
+                and sharkDistFromBoat < 420
+                and lastCloseBoatAgo > 12 then
+                journal("repark_triggered", {
+                    sharkDistFromBoat = sharkDistFromBoat,
+                    lastCloseBoatAgo = lastCloseBoatAgo,
+                })
+                lastCloseBoat = now()
+                endExternalCombat()
+                local farm = Flow.Features.Farm
+                if farm and farm.MoveTo then pcall(function() farm:MoveTo(CFrame.new(boatPosition + Vector3.new(0, 12, 0)), "sea_event_repark_boat") end) end
+                if isCurrent(generation) and runtime.seat and not otherPlayerDrives(runtime.seat) then
+                    local parked, parkedReason = driveBoatAway(generation, target, "Terror Shark voltou perto do barco; reposicionando antes de retomar o combate.")
+                    if parked and isCurrent(generation) and targetAlive(target) then
+                        local resumed = startCombat(generation, target)
+                        if resumed then setPhase("combat") end
+                    else
+                        runtime.targetBackoff[target] = now() + 6
+                        runtime.target = nil
+                        return parkedReason or "repark_failed"
+                    end
+                end
+            end
+            task.wait(0.06)
+        end
+        endExternalCombat()
+        destroyVortexLift()
+        local defeated = not targetAlive(target)
+        runtime.target = nil
+        runtime.boatSafeTarget = nil
+        runtime.boatAwayFallbackTarget = nil
+        if defeated and isCurrent(generation) then
+            if runtime.deferBoatLossUntilTargetDefeated then
+                local lossReason = runtime.combatBoatLossReason or runtime.boatLostReason or "boat_removed_during_combat"
+                journal("combat_target_defeated_with_boat_lost", {
+                    target = target.Name,
+                    reason = lossReason,
+                })
+                notify("Farm Eventos", "Terror Shark derrotado sem barco. Repondo o barco apenas agora para continuar o farm.", "success", "terror_defeated_boat_lost", 2)
+                -- The target is terminal; it is now safe to release the stale
+                -- native writer. restoreBoatControl clears the loss flag, so put
+                -- the retained reason back for the outer recovery worker.
+                clearNativeControl()
+                runtime.boat = nil
+                runtime.seat = nil
+                runtime.boatLostReason = lossReason
+                runtime.deferBoatLossUntilTargetDefeated = false
+                runtime.combatBoatLossReason = nil
+                return "target_defeated_boat_lost"
+            end
+            notify("Farm Eventos", "Terror Shark derrotado. Retornando ao barco.", "success", "terror_defeated", 1)
+            setPhase("returning_to_boat")
+            local returned, returnReason = returnToBoat(generation, "terror_defeated")
+            if not returned and runtime.boatLostReason then return "boat_lost" end
+            return returned and "target_defeated" or (returnReason or "return_failed")
+        end
+        if runtime.deferBoatLossUntilTargetDefeated then
+            -- A despawn is not a confirmed player kill. Preserve the player's
+            -- current life and stop instead of converting this into a sea reset.
+            journal("combat_target_lost_with_boat_lost", {
+                target = target.Name,
+                reason = runtime.combatBoatLossReason or runtime.boatLostReason,
+            })
+            setPhase("combat_target_lost_without_boat")
+            return "target_lost_with_boat_lost"
+        end
+        return runtime.boatLostReason and "boat_lost" or "target_gone"
+    end
+
+    -- `run` is forward-declared because a boat-loss reset restarts the same
+    -- active Farm generation after the character has respawned at Tiki.
+    local run
+
+    local function restartAfterCombatDeath(generation)
+        local runtime = EventFarm.Runtime
+        if not isCurrent(generation) then return false end
+        -- Respawned at Tiki after a combat death: do not make the character
+        -- chase the old hull across the sea. Re-enter the normal acquisition
+        -- flow and buy a fresh boat through the verified dealer instead.
+        clearNativeControl()
+        runtime.boat = nil
+        runtime.seat = nil
+        runtime.target = nil
+        runtime.boatSafeTarget = nil
+        runtime.forceFreshBoat = true
+        setPhase("restarting_after_combat_death")
+        task.spawn(function()
+            if isCurrent(generation) then run(generation) end
+        end)
+        return true
+    end
+
+    local function resetAfterBoatLoss(generation)
+        local runtime = EventFarm.Runtime
+        local lossReason = runtime.boatLostReason
+        if not lossReason then return false, "boat_loss_not_pending" end
+        if runtime.resettingAfterBoatLoss then return false, "boat_loss_reset_already_running" end
+        runtime.resettingAfterBoatLoss = true
+
+        -- Position, rather than DangerLevel, decides whether this is sea loss.
+        -- Therefore level 1 through 6 behave identically: a lost boat away
+        -- from Tiki resets immediately instead of walking/sailing back.
+        local lossPosition = runtime.lastPosition
+            or (runtime.seat and runtime.seat.Position)
+            or (rootPart() and rootPart().Position)
+        local resetAtSea = not isAtTiki(lossPosition)
+        setPhase(resetAtSea and "resetting_after_sea_boat_loss" or "replacing_boat_at_tiki", lossReason)
+        notify("Farm Eventos", resetAtSea
+            and "Barco perdido no mar. Resetando para voltar rápido a Tiki e comprar outro."
+            or "Barco perdido em Tiki. Comprando outro no Boat Dealer correto.",
+            "warning", "boat_lost_reset", 1)
+
+        clearNativeControl()
+        runtime.boat = nil
+        runtime.seat = nil
+        runtime.target = nil
+        runtime.forceFreshBoat = true
+        runtime.boatLostReason = nil
+
+        if resetAtSea then
+            local oldCharacter = player and player.Character
+            local h = humanoid()
+            if not h then
+                runtime.resettingAfterBoatLoss = false
+                return false, "character_missing_for_sea_reset"
+            end
+            pcall(function() h.Health = 0 end)
+            local deadline = now() + 18
+            repeat
+                task.wait(0.15)
+                local freshHumanoid = humanoid()
+                if player.Character ~= oldCharacter and freshHumanoid and freshHumanoid.Health > 0 and rootPart() then
+                    runtime.resettingAfterBoatLoss = false
+                    return true
+                end
+            until not isCurrent(generation) or now() >= deadline
+            runtime.resettingAfterBoatLoss = false
+            return false, "sea_reset_respawn_timeout"
+        end
+
+        runtime.resettingAfterBoatLoss = false
+        return isCurrent(generation), "stopped"
+    end
+
+    local function recoverBoatLossAndRestart(generation)
+        local recovered, reason = resetAfterBoatLoss(generation)
+        if recovered and isCurrent(generation) then
+            task.spawn(function()
+                if isCurrent(generation) then run(generation) end
+            end)
+            return true
+        end
+        if isCurrent(generation) then EventFarm:SetEnabled(false, reason or "boat_loss_recovery_failed") end
+        return false
+    end
+
+    run = function(generation)
+        local runtime = EventFarm.Runtime
+        local boat, acquireReason = acquireBoat(generation)
+        if not boat then
+            if isCurrent(generation) then
+                notify("Farm Eventos", "Não foi possível preparar o barco: " .. tostring(acquireReason), "error", "prepare_fail", 1)
+                EventFarm:SetEnabled(false, acquireReason)
+            end
+            return
+        end
+
+        -- One controlled replacement is allowed per run. This avoids repeatedly
+        -- buying boats while still recovering from a real Tiki obstruction.
+        local launchAttempt = 0
+        while isCurrent(generation) and launchAttempt < 2 do
+            launchAttempt = launchAttempt + 1
+            setPhase("entering_boat")
+            local attached, attachReason = attachNativeControl(boat)
+            if not attached then
+                local cannotReachOwnedBoat = attachReason == "could_not_enter_driver_seat"
+                if cannotReachOwnedBoat and runtime.tikiSeatRecoveryAttempts < 1 and isCurrent(generation) then
+                    -- A trapped Tiki hull and a hull left far offshore after a
+                    -- death have the same safe answer: never chase or reuse a
+                    -- seat that cannot be entered. Go straight to the verified
+                    -- west/open-sea dealer and force one clean replacement.
+                    runtime.tikiSeatRecoveryAttempts = runtime.tikiSeatRecoveryAttempts + 1
+                    runtime.forceFreshBoat = true
+                    runtime.boat = nil
+                    runtime.seat = nil
+                    local atTiki = isAtTiki(positionOf(boat))
+                    notify("Farm Eventos", atTiki
+                        and "Não foi possível entrar no barco preso em Tiki. Voltando ao Boat Dealer do mar aberto para comprar outro."
+                        or "Não foi possível entrar no barco perdido no mar. Voltando ao Boat Dealer do mar aberto para comprar outro.",
+                        "warning", "tiki_seat_rebuy", 1)
+                    task.spawn(function()
+                        if isCurrent(generation) then run(generation) end
+                    end)
+                    return
+                end
+                notify("Farm Eventos", "Não foi possível assumir o assento: " .. tostring(attachReason), "error", "seat_fail", 1)
+                EventFarm:SetEnabled(false, attachReason)
+                return
+            end
+            setPhase("settling_native_boat")
+            if not settleNativeBoat(generation) then
+                if runtime.boatLostReason then recoverBoatLossAndRestart(generation)
+                else EventFarm:SetEnabled(false, "native_boat_settle_failed") end
+                return
+            end
+
+            local currentBoatPosition = runtime.seat and runtime.seat.Position or positionOf(boat)
+            local readyForSea = true
+            if isAtTiki(currentBoatPosition) then
+                local escaped, escapeReason = setOpenSeaCourse(generation)
+                if not escaped then
+                    if runtime.boatLostReason then
+                        recoverBoatLossAndRestart(generation)
+                        return
+                    end
+                    -- Only the measured no-progress outcome is a reason to
+                    -- replace a boat. Manual stops and unrelated failures must
+                    -- never purchase another hull.
+                    local noMeaningfulProgress = type(escapeReason) == "string"
+                        and string.find(escapeReason, "open_sea_exit_not_confirmed_projection_", 1, true) ~= nil
+                    if isCurrent(generation) and noMeaningfulProgress and launchAttempt < 2 then
+                        notify("Farm Eventos", "Barco não avançou o suficiente saindo de Tiki; voltando ao Boat Dealer do mar aberto para comprar outro.", "warning", "tiki_rebuy", 1)
+                        local stuckBoat = runtime.boat or boat
+                        -- The Farm must not keep a stale RenderStep writer or
+                        -- control a seat while Farm.MoveTo returns to the NPC.
+                        clearNativeControl()
+                        runtime.boat = nil
+                        runtime.seat = nil
+                        runtime.target = nil
+                        local h = humanoid()
+                        if h then pcall(function() h.Sit = false end) end
+                        boat, escapeReason = buyReplacementBoatAtTikiWestDealer(generation, stuckBoat)
+                        if boat and isCurrent(generation) then
+                            notify("Farm Eventos", "Novo barco comprado no Boat Dealer do mar aberto. Tentando a saída de Tiki novamente.", "success", "tiki_rebuy_ok", 1)
+                            readyForSea = false
+                        else
+                            notify("Farm Eventos", "Não foi possível comprar o barco substituto: " .. tostring(escapeReason), "error", "tiki_rebuy_fail", 1)
+                            EventFarm:SetEnabled(false, escapeReason or "replacement_boat_unavailable")
+                            return
+                        end
+                    else
+                        if isCurrent(generation) then
+                            notify("Farm Eventos", "A saída para mar aberto falhou: " .. tostring(escapeReason), "error", "exit_fail", 1)
+                            EventFarm:SetEnabled(false, escapeReason)
+                        end
+                        return
+                    end
+                end
+            else
+                -- Already sailing at a real sea level: keep the native seat, skip
+                -- the Tiki lift/exit entirely, and only calibrate usable height.
+                local flatLook = runtime.seat and Vector3.new(runtime.seat.CFrame.LookVector.X, 0, runtime.seat.CFrame.LookVector.Z) or EventFarm.TikiOpenSeaDirection
+                runtime.cruiseDirection = flatLook.Magnitude > 0.01 and flatLook.Unit or EventFarm.TikiOpenSeaDirection
+                beginExistingSeaCalibration()
+            end
+
+            -- A failed Tiki escape may have replaced the hull above; attach to
+            -- that new instance before attempting the route again.
+            if readyForSea then
+                while isCurrent(generation) do
+                    local terror, seaReason = driveSea(generation)
+                    if seaReason == "boat_lost" or runtime.boatLostReason then
+                        recoverBoatLossAndRestart(generation)
+                        return
+                    end
+                    if seaReason == "character_died" then
+                        restartAfterCombatDeath(generation)
+                        return
+                    end
+                    if terror and isCurrent(generation) then
+                        local entered, fightReason = xpcall(function() return fightTerrorShark(generation, terror) end, function(err)
+                            return (debug and debug.traceback and debug.traceback(tostring(err), 2)) or tostring(err)
+                        end)
+                        if not entered then
+                            journal("fight_crash", {error = fightReason, target = terror.Name})
+                            endExternalCombat()
+                            runtime.target = nil
+                            setPhase("sea_cruise", "fight_crash")
+                            notify("Farm Eventos", "Falha de combate capturada; retornando ao cruzeiro sem deixar estado preso.", "warning", "fight_crash", 2)
+                        elseif fightReason == "character_died" then
+                            restartAfterCombatDeath(generation)
+                            return
+                        elseif fightReason == "target_defeated_boat_lost" then
+                            -- v1.6.6: only after the active Shark is terminal do
+                            -- we reset/rebuy for a lost hull.
+                            recoverBoatLossAndRestart(generation)
+                            return
+                        elseif fightReason == "target_lost_with_boat_lost" then
+                            -- No confirmed kill: preserve the player and stop;
+                            -- never turn a vanished target into a forced reset.
+                            EventFarm:SetEnabled(false, fightReason)
+                            return
+                        elseif fightReason == "boat_lost" or runtime.boatLostReason then
+                            recoverBoatLossAndRestart(generation)
+                            return
+                        end
+                    end
+                    if runtime.boatLostReason and not runtime.deferBoatLossUntilTargetDefeated then
+                        recoverBoatLossAndRestart(generation)
+                        return
+                    end
+                    if isCurrent(generation) then
+                        local seat = runtime.seat
+                        if not localOccupies(seat) and not otherPlayerDrives(seat) then
+                            local h = humanoid()
+                            if h then pcall(function() seat:Sit(h) end) end
+                        end
+                        waitSeconds(generation, 0.25)
+                    end
+                end
+                return
+            end
+        end
+    end
+
+    function EventFarm:SetEnabled(active, reason)
+        active = active == true
+        local runtime = self.Runtime
+        if active then
+            if runtime.active then return true end
+            if type(State.eventFarmBoat) ~= "string" or State.eventFarmBoat == "" then
+                State.eventFarmEnabled = false
+                notify("Farm Eventos", "Selecione um barco antes de ligar o Auto Farm Eventos.", "error", "missing_boat", 1)
+                return false, "boat_required"
+            end
+            local boatStillMapped = false
+            for _, boat in ipairs(getBoatInfoList()) do
+                if boat.name == State.eventFarmBoat then boatStillMapped = true break end
+            end
+            if not boatStillMapped then
+                State.eventFarmEnabled = false
+                notify("Farm Eventos", "O barco escolhido não está no catálogo disponível deste servidor.", "error", "invalid_boat", 1)
+                return false, "boat_not_in_runtime_catalog"
+            end
+            if State.eventFarmTarget ~= "terror_shark" then
+                State.eventFarmEnabled = false
+                notify("Farm Eventos", "Selecione Terror Shark antes de ligar o Auto Farm Eventos.", "error", "missing_event", 1)
+                return false, "event_required"
+            end
+            -- BoatLocal has an independent heartbeat writer. Stop its optional
+            -- manual overrides before the farm begins so one module owns the
+            -- native boat properties for this run.
+            local manualBoat = Flow.Features.BoatLocal
+            if manualBoat then
+                pcall(function() manualBoat:SetGeneralEnabled(false) end)
+                pcall(function() manualBoat:SetFloatEnabled(false) end)
+            end
+            runtime.active = true
+            runtime.generation = runtime.generation + 1
+            runtime.startedAt = now()
+            runtime.reason = nil
+            if State.eventFarmTransitAssist == nil then State.eventFarmTransitAssist = true end
+            runtime.lastStopReason = nil
+            runtime.lastFailureReason = nil
+            runtime.journal = {}
+            runtime.attackJournalAt = {}
+            runtime.marker = {mode = "none", lastGood = nil, seenFor = 0, missingFor = 0}
+            runtime.stalledFor = 0
+            runtime.preStallLift = nil
+            runtime.stallBoost = 0
+            runtime.boatLostReason = nil
+            runtime.deferBoatLossUntilTargetDefeated = false
+            runtime.combatBoatLossReason = nil
+            runtime.resettingAfterBoatLoss = false
+            runtime.forceFreshBoat = false
+            runtime.tikiSeatRecoveryAttempts = 0
+            runtime.targetBackoff = {}
+            runtime.boatSafeTarget = nil
+            runtime.boatSafeAt = 0
+            runtime.raidExitQuietSince = nil
+            runtime.raidExitCooldown = 0
+            runtime.vortexSignal = nil
+            installVortexWatch()
+            State.eventFarmEnabled = true
+            local generation = runtime.generation
+            setPhase("preparing")
+            notify("Farm Eventos", "Auto Farm Eventos iniciado.", "success", "farm_started", 1)
+            task.spawn(function() run(generation) end)
+            return true
+        end
+        if not runtime.active and not State.eventFarmEnabled then return true end
+        runtime.active = false
+        runtime.lastStopReason = reason or "disabled"
+        journal("stopped", {reason = runtime.lastStopReason})
+        runtime.generation = runtime.generation + 1
+        State.eventFarmEnabled = false
+        endExternalCombat()
+        destroyVortexLift()
+        disconnectVortexWatch()
+        clearNativeControl()
+        runtime.boat = nil
+        runtime.seat = nil
+        runtime.target = nil
+        setPhase("idle", reason or "disabled")
+        if reason and reason ~= "disabled" and reason ~= "hub_closed" then
+            Flow:Log("Sea Farm stopped: " .. tostring(reason))
+        end
+        return true
+    end
+
+    function EventFarm:Shutdown()
+        return self:SetEnabled(false, "hub_closed")
+    end
+
+    Flow.Features.EventFarm = EventFarm
 end)(Flow)
 
 -- >>> MODULE: features/race_v4.lua
@@ -8411,11 +11604,13 @@ end)(Flow)
         return workspace and object and object:IsDescendantOf(workspace) and not isHeldByAnyPlayer(object)
     end
 
-    local function addFruit(list, seen, tool)
+    local function addFruit(list, seen, tool, includeUnselected)
         if seen[tool] or not tool or not tool:IsA("Tool") then return end
         if not isWorldDrop(tool) then return end
         if not Finder.Known[tool.Name] and not string.find(tool.Name, "Fruit", 1, true) then return end
-        if not Flow.State.allFruits and not Flow.State.selectedFruits[tool.Name] then return end
+        -- ESP reads every ground fruit independently of the collection filter;
+        -- collection itself preserves the user's selected-fruit preference.
+        if not includeUnselected and not Flow.State.allFruits and not Flow.State.selectedFruits[tool.Name] then return end
         local handle = tool:FindFirstChild("Handle")
         if not handle or not handle:IsA("BasePart") then return end
         seen[tool] = true
@@ -8427,7 +11622,7 @@ end)(Flow)
         })
     end
 
-    function Finder:Scan()
+    function Finder:Scan(includeUnselected)
         if not workspace then return {} end
         local results, seen = {}, {}
 
@@ -8437,16 +11632,16 @@ end)(Flow)
         if collectionService then
             local ok, tagged = pcall(function() return collectionService:GetTagged("Fruit") end)
             if ok and type(tagged) == "table" then
-                for _, object in ipairs(tagged) do addFruit(results, seen, object) end
+                for _, object in ipairs(tagged) do addFruit(results, seen, object, includeUnselected) end
             end
         end
 
         for _, object in ipairs(workspace:GetChildren()) do
-            if object:IsA("Tool") then addFruit(results, seen, object) end
+            if object:IsA("Tool") then addFruit(results, seen, object, includeUnselected) end
         end
         if #results == 0 then
             for _, object in ipairs(workspace:GetDescendants()) do
-                if object:IsA("Tool") then addFruit(results, seen, object) end
+                if object:IsA("Tool") then addFruit(results, seen, object, includeUnselected) end
             end
         end
 
@@ -8648,6 +11843,652 @@ end)(Flow)
     end
 
     Flow.Features.FruitFinder = Finder
+end)(Flow)
+
+-- >>> MODULE: features/esp/esp_manager.lua
+;(function(Flow)
+    local ESP = {}
+    local State = Flow.State
+    local Workspace = Flow.Services.Workspace
+    local Players = Flow.Services.Players
+    local RunService = Flow.Services.RunService
+    local CollectionService = Flow.Services.CollectionService
+    local Finder = Flow.Features.FruitFinder
+    local TravelLocations = Flow.Features.TravelLocations
+
+    local typeOrder = {"fruit", "islands", "players", "bosses", "chests", "race_v2", "berries", "haki", "special"}
+    ESP.TypeOrder = typeOrder
+    ESP.TypeLabels = {
+        fruit = "Fruit", islands = "Islands", players = "Players", bosses = "Bosses", chests = "Chests",
+        race_v2 = "Race V2 Flowers", berries = "Berries", haki = "Haki & useful NPCs", special = "Special events",
+    }
+
+    local knownBosses = {}
+    for _, name in ipairs({
+        "Saber Expert", "The Saw", "Greybeard", "The Gorilla King", "Chef", "Yeti", "Vice Admiral", "Swan",
+        "Chief Warden", "Warden", "Magma Admiral", "Fishman Lord", "Wysper", "Thunder God", "Cyborg",
+        "Don Swan", "Cursed Captain", "Darkbeard", "Diamond", "Jeremy", "Orbitus", "Smoke Admiral",
+        "Awakened Ice Admiral", "Tide Keeper", "Tyrant of the Skies", "Cake Prince", "Dough King",
+        "rip_indra True Form", "Stone", "Hydra Leader", "Kilo Admiral", "Captain Elephant", "Beautiful Pirate",
+        "Cake Queen", "Longma", "Island Empress", "Soul Reaper", "Cursed Skeleton Boss", "Beautiful Pirate",
+        "rip_indra", "rip_indra True Form", "Leviathan", "Leviathan Segment", "Terrorshark", "Terror Shark", "Sea Beast",
+    }) do knownBosses[string.lower(name)] = true end
+
+    local usefulNpcNeedles = {
+        "master of enhancement", "color specialist", "horned man", "alchemist", "legendary sword dealer",
+        "beast hunter", "shark hunter", "dragon wizard", "mysterious entity", "shipwright teacher",
+    }
+    local specialNeedles = {"leviathan", "terror shark", "terrorshark", "sea beast", "mirage", "kitsune", "prehistoric"}
+    local specialMapNames = {MysticIsland = true, MirageIsland = true, KitsuneIsland = true, PrehistoricIsland = true, LeviathanGate = true}
+
+    ESP.Runtime = {
+        alive = false,
+        gui = nil,
+        visualFolder = nil,
+        virtualFolder = nil,
+        overlay = nil,
+        entries = {},
+        -- Roblox's tostring(Instance) is usually just its Name (for example,
+        -- every Chest1). Keep a weak per-instance id so same-named live
+        -- objects never overwrite each other's ESP entry.
+        objectIds = setmetatable({}, {__mode = "k"}),
+        nextObjectId = 0,
+        counts = {},
+        connection = nil,
+        lastScan = 0,
+        lastRender = 0,
+    }
+
+    local function lower(value)
+        return string.lower(tostring(value or ""))
+    end
+
+    local function colorOf(value, fallback)
+        value = type(value) == "table" and value or fallback or {255, 255, 255}
+        return Color3.fromRGB(
+            math.max(0, math.min(255, math.floor(tonumber(value[1]) or 255))),
+            math.max(0, math.min(255, math.floor(tonumber(value[2]) or 255))),
+            math.max(0, math.min(255, math.floor(tonumber(value[3]) or 255)))
+        )
+    end
+
+    local function validInstance(object)
+        return object and typeof(object) == "Instance" and object.Parent ~= nil
+    end
+
+    local function isWorldObject(object)
+        return validInstance(object) and Workspace and object:IsDescendantOf(Workspace)
+    end
+
+    local function rootPart(object)
+        if not validInstance(object) then return nil end
+        if object:IsA("BasePart") then return object end
+        if object:IsA("Model") then
+            local root = object:FindFirstChild("HumanoidRootPart") or object.PrimaryPart
+            if root and root:IsA("BasePart") then return root end
+        end
+        local handle = object:FindFirstChild("Handle", true)
+        if handle and handle:IsA("BasePart") then return handle end
+        local part = object:FindFirstChildWhichIsA("BasePart", true)
+        return part
+    end
+
+    local function objectPosition(object)
+        local part = rootPart(object)
+        return part and part.Position or nil
+    end
+
+    local function localRoot()
+        local character = Players and Players.LocalPlayer and Players.LocalPlayer.Character
+        return character and character:FindFirstChild("HumanoidRootPart")
+    end
+
+    local function typeSettings(category)
+        State.espTypes = type(State.espTypes) == "table" and State.espTypes or {}
+        return State.espTypes[category]
+    end
+
+    local function isEnabled(category)
+        local settings = typeSettings(category)
+        return State.espMasterEnabled == true and type(settings) == "table" and settings.enabled == true
+    end
+
+    local function contains(text, needles)
+        text = lower(text)
+        for _, needle in ipairs(needles) do
+            if string.find(text, needle, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function sourceKey(value)
+        if typeof(value) == "Instance" then
+            local id = ESP.Runtime.objectIds[value]
+            if not id then
+                ESP.Runtime.nextObjectId = ESP.Runtime.nextObjectId + 1
+                id = ESP.Runtime.nextObjectId
+                ESP.Runtime.objectIds[value] = id
+            end
+            return "instance_" .. tostring(id)
+        end
+        return tostring(value)
+    end
+
+    local function candidate(category, key, object, name, options)
+        options = options or {}
+        return {
+            category = category,
+            key = category .. ":" .. sourceKey(key),
+            object = object,
+            name = name or (object and object.Name) or category,
+            position = options.position,
+            virtual = options.virtual == true,
+            humanoid = options.humanoid,
+            detail = options.detail,
+        }
+    end
+
+    local function gatherFruits(list)
+        if not Finder or type(Finder.Scan) ~= "function" then return end
+        local ok, fruits = pcall(function() return Finder:Scan(true) end)
+        if not ok or type(fruits) ~= "table" then return end
+        for _, fruit in ipairs(fruits) do
+            if fruit.object and isWorldObject(fruit.object) then
+                list[#list + 1] = candidate("fruit", fruit.object, fruit.object, fruit.name, {position = fruit.position, detail = fruit.rarity})
+            end
+        end
+    end
+
+    local function gatherPlayers(list)
+        if not Players then return end
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= Players.LocalPlayer and player.Character then
+                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                local root = rootPart(player.Character)
+                if root then
+                    local display = player.DisplayName and player.DisplayName ~= "" and player.DisplayName or player.Name
+                    if display ~= player.Name then display = display .. " @" .. player.Name end
+                    list[#list + 1] = candidate("players", tostring(player.UserId), player.Character, display, {humanoid = humanoid})
+                end
+            end
+        end
+    end
+
+    local function looksLikeBoss(model)
+        if not model or not model:IsA("Model") then return false end
+        local name = lower(model.Name)
+        if knownBosses[name] or string.find(name, "boss", 1, true) then return true end
+        local marked = model:GetAttribute("IsBoss")
+        return marked == true or model:GetAttribute("Boss") == true
+    end
+
+    local function gatherBosses(list)
+        local containers, seen = {}, {}
+        local enemies = Workspace and Workspace:FindFirstChild("Enemies")
+        local seaBeasts = Workspace and Workspace:FindFirstChild("SeaBeasts")
+        if enemies then containers[#containers + 1] = enemies end
+        if seaBeasts then containers[#containers + 1] = seaBeasts end
+        for _, container in ipairs(containers) do
+            if container then
+                for _, model in ipairs(container:GetChildren()) do
+                    if not seen[model] and looksLikeBoss(model) and rootPart(model) then
+                        seen[model] = true
+                        list[#list + 1] = candidate("bosses", model, model, model.Name, {humanoid = model:FindFirstChildOfClass("Humanoid")})
+                    end
+                end
+            end
+        end
+    end
+
+    local function gatherChests(list)
+        local seen, foundTagged = {}, false
+        if CollectionService then
+            local ok, tagged = pcall(function() return CollectionService:GetTagged("_ChestTagged") end)
+            if ok and type(tagged) == "table" then
+                for _, object in ipairs(tagged) do
+                    if not seen[object] and isWorldObject(object) and rootPart(object) and object:GetAttribute("IsDisabled") ~= true then
+                        seen[object] = true
+                        foundTagged = true
+                        list[#list + 1] = candidate("chests", object, object, object.Name)
+                    end
+                end
+            end
+        end
+        -- The map's ChestModels are replicated even if a tag is late; they are
+        -- an intentionally narrow fallback, not a broad name scan.
+        local models = Workspace and Workspace:FindFirstChild("ChestModels")
+        if models and not foundTagged then
+            for _, object in ipairs(models:GetChildren()) do
+                if not seen[object] and rootPart(object) then
+                    seen[object] = true
+                    list[#list + 1] = candidate("chests", object, object, object.Name)
+                end
+            end
+        end
+    end
+
+    local function gatherIslands(list)
+        local seen = {}
+        if TravelLocations and type(TravelLocations.GetAll) == "function" then
+            local ok, locations = pcall(function() return TravelLocations:GetAll() end)
+            if ok and type(locations) == "table" then
+                for _, item in ipairs(locations) do
+                    local point = item and item.position
+                    local position = typeof(point) == "CFrame" and point.Position or (typeof(point) == "Vector3" and point or nil)
+                    if position and item.id and not seen[item.id] then
+                        seen[item.id] = true
+                        list[#list + 1] = candidate("islands", item.id, nil, item.name, {position = position, virtual = true})
+                    end
+                end
+            end
+        end
+        -- Dynamic special islands are collected in Special events instead of
+        -- duplicating their label among permanent travel destinations.
+    end
+
+    local function gatherRaceV2(list)
+        for index = 1, 2 do
+            local flower = Workspace and Workspace:FindFirstChild("Flower" .. tostring(index))
+            local part = rootPart(flower)
+            local transparent = part and part.Transparency or 1
+            if part and transparent < 0.98 then
+                list[#list + 1] = candidate("race_v2", flower, flower, "Race V2 Flower " .. tostring(index))
+            end
+        end
+        local enemies = Workspace and Workspace:FindFirstChild("Enemies")
+        if enemies then
+            for _, model in ipairs(enemies:GetChildren()) do
+                if lower(model.Name) == "swan pirate" and rootPart(model) then
+                    list[#list + 1] = candidate("race_v2", model, model, "Flower 3 · Swan Pirate", {humanoid = model:FindFirstChildOfClass("Humanoid")})
+                end
+            end
+        end
+    end
+
+    local function berryName(bush)
+        local attributes = bush and bush:GetAttributes() or {}
+        for key, value in pairs(attributes) do
+            if value and value ~= false then
+                return type(value) == "string" and value or tostring(key)
+            end
+        end
+        local holder = bush and bush.Parent
+        local berries = holder and holder:FindFirstChild("Berries")
+        if berries and berries ~= bush then
+            for key, value in pairs(berries:GetAttributes()) do
+                if value and value ~= false then return type(value) == "string" and value or tostring(key) end
+            end
+        end
+        return nil
+    end
+
+    local function gatherBerries(list)
+        if not CollectionService then return end
+        local ok, tagged = pcall(function() return CollectionService:GetTagged("BerryBush") end)
+        if not ok or type(tagged) ~= "table" then return end
+        for _, bush in ipairs(tagged) do
+            local name = berryName(bush)
+            local owner = rootPart(bush) and bush or (bush and bush.Parent)
+            if name and owner and rootPart(owner) and isWorldObject(owner) then
+                list[#list + 1] = candidate("berries", bush, owner, name)
+            end
+        end
+    end
+
+    local function gatherUsefulNpcs(list)
+        local npcs = Workspace and Workspace:FindFirstChild("NPCs")
+        if not npcs then return end
+        for _, npc in ipairs(npcs:GetChildren()) do
+            if rootPart(npc) and contains(npc.Name, usefulNpcNeedles) then
+                list[#list + 1] = candidate("haki", npc, npc, npc.Name)
+            end
+        end
+    end
+
+    local function gatherSpecial(list)
+        local seen = {}
+        local map = Workspace and Workspace:FindFirstChild("Map")
+        if map then
+            for _, object in ipairs(map:GetChildren()) do
+                if specialMapNames[object.Name] and rootPart(object) then
+                    seen[object] = true
+                    list[#list + 1] = candidate("special", object, object, object.Name)
+                end
+            end
+        end
+        local containers = {}
+        local enemies = Workspace and Workspace:FindFirstChild("Enemies")
+        local seaBeasts = Workspace and Workspace:FindFirstChild("SeaBeasts")
+        if enemies then containers[#containers + 1] = enemies end
+        if seaBeasts then containers[#containers + 1] = seaBeasts end
+        for _, container in ipairs(containers) do
+            for _, model in ipairs(container:GetChildren()) do
+                if not seen[model] and rootPart(model) and contains(model.Name, specialNeedles) then
+                    seen[model] = true
+                    list[#list + 1] = candidate("special", model, model, model.Name, {humanoid = model:FindFirstChildOfClass("Humanoid")})
+                end
+            end
+        end
+    end
+
+    local gatherers = {
+        fruit = gatherFruits, islands = gatherIslands, players = gatherPlayers, bosses = gatherBosses,
+        chests = gatherChests, race_v2 = gatherRaceV2, berries = gatherBerries, haki = gatherUsefulNpcs, special = gatherSpecial,
+    }
+
+    local function visualParent()
+        local parent = nil
+        local ok, result = pcall(function() return gethui and gethui() or nil end)
+        if ok and result then parent = result end
+        if not parent then
+            local coreGui = game and game:GetService("CoreGui")
+            parent = coreGui or (Players and Players.LocalPlayer and Players.LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+        end
+        return parent
+    end
+
+    local function clearObject(object)
+        if object then pcall(function() object:Destroy() end) end
+    end
+
+    local function destroyEntry(key)
+        local entry = ESP.Runtime.entries[key]
+        if not entry then return end
+        clearObject(entry.highlight)
+        clearObject(entry.box)
+        clearObject(entry.label)
+        clearObject(entry.tracer)
+        clearObject(entry.anchor)
+        ESP.Runtime.entries[key] = nil
+    end
+
+    function ESP:Clear()
+        for key in pairs(self.Runtime.entries) do destroyEntry(key) end
+        self.Runtime.counts = {}
+    end
+
+    local function ensureEntry(target)
+        local entry = ESP.Runtime.entries[target.key]
+        if entry then return entry end
+        entry = {target = target}
+        ESP.Runtime.entries[target.key] = entry
+        return entry
+    end
+
+    local function ensureAnchor(entry, position)
+        if entry.anchor and entry.anchor.Parent then
+            entry.anchor.Position = position
+            return entry.anchor
+        end
+        local folder = ESP.Runtime.virtualFolder
+        if not folder then return nil end
+        local anchor = Instance.new("Part")
+        anchor.Name = "ESPAnchor_" .. tostring(entry.target.key)
+        anchor.Anchored = true
+        anchor.CanCollide = false
+        anchor.CanQuery = false
+        anchor.CanTouch = false
+        anchor.CastShadow = false
+        anchor.Size = Vector3.new(0.1, 0.1, 0.1)
+        anchor.Transparency = 1
+        anchor.Position = position
+        anchor.Parent = folder
+        entry.anchor = anchor
+        return anchor
+    end
+
+    local function ensureVisuals(entry, adornment, canGeometry)
+        local folder = ESP.Runtime.visualFolder
+        if not folder or not adornment then return end
+        if not entry.label then
+            local label = Instance.new("BillboardGui")
+            label.Name = "FlowKanESPLabel"
+            label.AlwaysOnTop = true
+            label.MaxDistance = 0
+            label.Size = UDim2.new(0, 240, 0, 42)
+            label.StudsOffsetWorldSpace = Vector3.new(0, 2.8, 0)
+            label.Parent = folder
+            local text = Instance.new("TextLabel")
+            text.Name = "Text"
+            text.BackgroundTransparency = 1
+            text.Size = UDim2.fromScale(1, 1)
+            text.Font = Enum.Font.GothamBold
+            text.TextStrokeTransparency = 0.12
+            text.TextYAlignment = Enum.TextYAlignment.Center
+            text.TextWrapped = true
+            text.Parent = label
+            entry.label = label
+            entry.text = text
+        end
+        entry.label.Adornee = adornment
+        if canGeometry and not entry.highlight then
+            local highlight = Instance.new("Highlight")
+            highlight.Name = "FlowKanESPHighlight"
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.Parent = folder
+            entry.highlight = highlight
+        end
+        if canGeometry and not entry.box then
+            local box = Instance.new("SelectionBox")
+            box.Name = "FlowKanESPBox"
+            box.SurfaceTransparency = 1
+            -- SelectionBox is a PVAdornment, not a HandleAdornment: it has no
+            -- AlwaysOnTop property on every Roblox client. Assigning that
+            -- invalid member stopped the render callback before later ESP
+            -- entries could be drawn.
+            box.Parent = folder
+            entry.box = box
+        end
+        if not entry.tracer and ESP.Runtime.overlay then
+            local tracer = Instance.new("Frame")
+            tracer.Name = "FlowKanESPTracer"
+            tracer.BorderSizePixel = 0
+            tracer.AnchorPoint = Vector2.new(0, 0.5)
+            tracer.Visible = false
+            tracer.ZIndex = 1
+            tracer.Parent = ESP.Runtime.overlay
+            entry.tracer = tracer
+        end
+    end
+
+    local function healthOf(target)
+        local humanoid = target.humanoid
+        if not humanoid and target.object and target.object:IsA("Model") then humanoid = target.object:FindFirstChildOfClass("Humanoid") end
+        if humanoid then
+            local ok, health, maxHealth = pcall(function() return humanoid.Health, humanoid.MaxHealth end)
+            if ok then return math.max(0, math.floor(health + 0.5)), math.max(0, math.floor(maxHealth + 0.5)) end
+        end
+        return nil, nil
+    end
+
+    local function displayText(target, settings, distance)
+        local lines = {}
+        if settings.showName ~= false then lines[#lines + 1] = target.name end
+        if settings.showDistance ~= false then lines[#lines + 1] = tostring(math.floor(distance + 0.5)) .. " studs" end
+        if settings.showHealth then
+            local health, maximum = healthOf(target)
+            if health and maximum then lines[#lines + 1] = tostring(health) .. " / " .. tostring(maximum) end
+        end
+        return table.concat(lines, "\n")
+    end
+
+    local function updateTracer(entry, position, visible, color, settings)
+        local tracer = entry.tracer
+        if not tracer then return end
+        if not visible or settings.tracer ~= true then tracer.Visible = false return end
+        local camera = Workspace and Workspace.CurrentCamera
+        if not camera then tracer.Visible = false return end
+        local projected, onScreen = camera:WorldToViewportPoint(position)
+        if not onScreen or projected.Z <= 0 then tracer.Visible = false return end
+        local viewport = camera.ViewportSize
+        local fromY = State.espTracerOrigin == "center" and math.floor(viewport.Y * 0.5) or viewport.Y - 8
+        local dx, dy = projected.X - viewport.X * 0.5, projected.Y - fromY
+        local length = math.sqrt(dx * dx + dy * dy)
+        if length < 2 then tracer.Visible = false return end
+        tracer.BackgroundColor3 = color
+        tracer.BackgroundTransparency = math.max(0, math.min(0.95, tonumber(State.espTracerTransparency) or 0.15))
+        tracer.Size = UDim2.fromOffset(length, math.max(1, math.floor(tonumber(State.espTracerThickness) or 1)))
+        tracer.Position = UDim2.fromOffset(math.floor(viewport.X * 0.5), math.floor(fromY))
+        tracer.Rotation = math.deg(math.atan2(dy, dx))
+        tracer.Visible = true
+    end
+
+    local function updateEntry(entry)
+        local target = entry.target
+        local settings = typeSettings(target.category)
+        if type(settings) ~= "table" or not settings.enabled or not State.espMasterEnabled then
+            if entry.highlight then entry.highlight.Enabled = false end
+            if entry.box then entry.box.Visible = false end
+            if entry.label then entry.label.Enabled = false end
+            if entry.tracer then entry.tracer.Visible = false end
+            return false
+        end
+        if target.object and not isWorldObject(target.object) and not target.virtual then return false end
+        local position = target.virtual and target.position or objectPosition(target.object)
+        if not position then return false end
+        local mine = localRoot()
+        local distance = mine and (mine.Position - position).Magnitude or math.huge
+        local maximum = math.max(0, tonumber(State.espMaxDistance) or 0)
+        -- Zero is the persisted "Unlimited" selection.
+        local visible = maximum <= 0 or distance <= maximum
+        local adornment = target.virtual and ensureAnchor(entry, position) or rootPart(target.object)
+        if not adornment then return false end
+        ensureVisuals(entry, adornment, not target.virtual)
+        local color = colorOf(settings.color)
+        if entry.label then
+            entry.label.Enabled = visible and ((settings.showName ~= false) or (settings.showDistance ~= false) or settings.showHealth == true)
+            entry.label.Adornee = adornment
+            entry.text.Text = displayText(target, settings, distance)
+            entry.text.TextColor3 = color
+            entry.text.TextSize = math.max(8, math.min(28, tonumber(State.espTextSize) or 13))
+            entry.text.TextStrokeTransparency = State.espTextOutline == false and 1 or 0.12
+        end
+        if entry.highlight then
+            entry.highlight.Adornee = adornment
+            entry.highlight.FillColor = color
+            entry.highlight.OutlineColor = color
+            entry.highlight.FillTransparency = math.max(0, math.min(1, tonumber(State.espFillTransparency) or 0.78))
+            entry.highlight.OutlineTransparency = math.max(0, math.min(1, tonumber(State.espOutlineTransparency) or 0.08))
+            entry.highlight.Enabled = visible and settings.highlight == true
+        end
+        if entry.box then
+            entry.box.Adornee = adornment
+            entry.box.Color3 = color
+            entry.box.LineThickness = math.max(0.01, math.min(0.1, (tonumber(State.espBoxThickness) or 1) / 100))
+            entry.box.Transparency = math.max(0, math.min(1, tonumber(State.espBoxTransparency) or 0.05))
+            entry.box.Visible = visible and settings.box == true
+        end
+        updateTracer(entry, position, visible, color, settings)
+        return true
+    end
+
+    function ESP:Refresh()
+        if not self.Runtime.alive then return end
+        local desired = {}
+        local counts = {}
+        if State.espMasterEnabled then
+            for _, category in ipairs(typeOrder) do
+                if isEnabled(category) then
+                    local results = {}
+                    local gather = gatherers[category]
+                    if gather then pcall(gather, results) end
+                    for _, target in ipairs(results) do
+                        desired[target.key] = target
+                        counts[category] = (counts[category] or 0) + 1
+                        local entry = ensureEntry(target)
+                        entry.target = target
+                    end
+                end
+            end
+        end
+        for key in pairs(self.Runtime.entries) do
+            if not desired[key] then destroyEntry(key) end
+        end
+        self.Runtime.counts = counts
+    end
+
+    function ESP:GetSnapshot()
+        local copy = {}
+        for _, category in ipairs(typeOrder) do copy[category] = self.Runtime.counts[category] or 0 end
+        return {enabled = State.espMasterEnabled == true, counts = copy, entries = self.Runtime.entries}
+    end
+
+    function ESP:SetMaster(enabled)
+        State.espMasterEnabled = enabled == true
+        if not State.espMasterEnabled then self:Clear() else self:Refresh() end
+        return State.espMasterEnabled
+    end
+
+    function ESP:Shutdown()
+        if self.Runtime.connection then pcall(function() self.Runtime.connection:Disconnect() end) end
+        self.Runtime.connection = nil
+        self.Runtime.alive = false
+        self:Clear()
+        clearObject(self.Runtime.gui)
+        clearObject(self.Runtime.virtualFolder)
+        self.Runtime.gui, self.Runtime.visualFolder, self.Runtime.virtualFolder, self.Runtime.overlay = nil, nil, nil, nil
+    end
+
+    function ESP:Start()
+        if self.Runtime.alive then return true end
+        local parent = visualParent()
+        if not parent then return false, "esp_ui_parent_missing" end
+        local old = parent:FindFirstChild("FlowKanHubESP")
+        if old then pcall(function() old:Destroy() end) end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "FlowKanHubESP"
+        gui.ResetOnSpawn = false
+        gui.IgnoreGuiInset = true
+        gui.DisplayOrder = 1100
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        gui.Parent = parent
+        local visualFolder = Instance.new("Folder")
+        visualFolder.Name = "Visuals"
+        visualFolder.Parent = gui
+        local overlay = Instance.new("Frame")
+        overlay.Name = "Tracers"
+        overlay.BackgroundTransparency = 1
+        overlay.Size = UDim2.fromScale(1, 1)
+        overlay.Active = false
+        overlay.Parent = gui
+        local oldAnchors = Workspace and Workspace:FindFirstChild("FlowKanHubESPAnchors")
+        if oldAnchors then pcall(function() oldAnchors:Destroy() end) end
+        local virtualFolder = Instance.new("Folder")
+        virtualFolder.Name = "FlowKanHubESPAnchors"
+        virtualFolder.Parent = Workspace
+        self.Runtime.alive = true
+        self.Runtime.gui, self.Runtime.visualFolder, self.Runtime.overlay, self.Runtime.virtualFolder = gui, visualFolder, overlay, virtualFolder
+        self.Runtime.lastScan, self.Runtime.lastRender = 0, 0
+        task.spawn(function()
+            while ESP.Runtime.alive do
+                if State.espMasterEnabled then
+                    ESP:Refresh()
+                elseif next(ESP.Runtime.entries) then
+                    -- Covers profile reset/load paths that change the saved
+                    -- master flag without going through the visible toggle.
+                    ESP:Clear()
+                end
+                task.wait(math.max(0.20, tonumber(State.espRefreshInterval) or 0.6))
+            end
+        end)
+        if RunService then
+            self.Runtime.connection = RunService.RenderStepped:Connect(function()
+                if not ESP.Runtime.alive then return end
+                local now = os.clock()
+                if now - ESP.Runtime.lastRender >= 0.06 then
+                    ESP.Runtime.lastRender = now
+                    for key, entry in pairs(ESP.Runtime.entries) do
+                        if not updateEntry(entry) then destroyEntry(key) end
+                    end
+                end
+            end)
+        end
+        if State.espMasterEnabled then self:Refresh() end
+        return true
+    end
+
+    ESP:Start()
+    Flow.Features.ESP = ESP
 end)(Flow)
 
 -- >>> MODULE: features/system_priority.lua
@@ -12506,6 +16347,26 @@ end)(Flow)
             Language.Translations[code][key] = value
         end
     end
+    local boatLocalLabels = {
+        ["en"] = {
+            boat_local = "LOCAL BOAT", boat_float = "FLOAT", boat_general_apply = "Apply General Settings", boat_general_apply_desc = "only changes the values whose sliders you moved", boat_speed = "Boat Speed", boat_speed_desc = "40 - 400; the live game default is shown until you move it", boat_torque = "Steering Torque", boat_torque_desc = "1 - 20; higher values turn more firmly", boat_turn_speed = "Turn Speed", boat_turn_speed_desc = "0.01 - 12; native seat turning response", boat_restore_default = "RESTORE GAME DEFAULTS", boat_restore_general_desc = "clear speed, torque and turn overrides", boat_float_apply = "Enable Float", boat_float_apply_desc = "only changes vertical support after a float value is selected", boat_float_height = "Float Height", boat_float_height_desc = "0 - 500 studs above the game boat height", boat_vertical_rate = "Vertical Speed", boat_vertical_rate_desc = "20 - 300 studs/s; continuous target movement", boat_obstacle_jump = "Jump Obstacles", boat_obstacle_jump_desc = "while you hold forward and the boat is blocked, rise then return to the configured height", boat_obstacle_delay = "Blocked Time", boat_obstacle_delay_desc = "0.2 - 5 seconds stopped before rising", boat_obstacle_speed = "Stopped-Speed Threshold", boat_obstacle_speed_desc = "0 - 150 physical studs/s while forward is held", boat_obstacle_extra = "Obstacle Extra Height", boat_obstacle_extra_desc = "20 - 300 additional studs while blocked", boat_obstacle_rise = "Obstacle Rise Speed", boat_obstacle_rise_desc = "50 - 500 studs/s, then returns without teleport", boat_obstacle_return = "Obstacle Return Speed", boat_obstacle_return_desc = "50 - 500 studs/s back to float height", boat_restore_float_desc = "clear only the float-height override", boat_status_no_boat = "Sit in the root VehicleSeat of your own boat to configure it.", boat_status_ready = "%s · driver seat active", boat_status_waiting = "%s · waiting for driver seat", boat_status_lift = "Float +%.0f · obstacle +%.0f",
+        },
+        ["pt-BR"] = {
+            boat_local = "BARCO LOCAL", boat_float = "FLUTUAR", boat_general_apply = "Aplicar ajustes gerais", boat_general_apply_desc = "só altera os valores das barras que você mudou", boat_speed = "Velocidade do barco", boat_speed_desc = "40 - 400; mostra o padrão do jogo até você mover a barra", boat_torque = "Torque de direção", boat_torque_desc = "1 - 20; valores maiores viram com mais firmeza", boat_turn_speed = "Velocidade de giro", boat_turn_speed_desc = "0,01 - 12; resposta nativa de giro do assento", boat_restore_default = "RESTAURAR PADRÃO DO JOGO", boat_restore_general_desc = "limpa os ajustes de velocidade, torque e giro", boat_float_apply = "Ativar flutuação", boat_float_apply_desc = "só altera o suporte vertical após escolher um valor de flutuação", boat_float_height = "Altura de flutuação", boat_float_height_desc = "0 - 500 studs acima da altura normal do barco", boat_vertical_rate = "Velocidade vertical", boat_vertical_rate_desc = "20 - 300 studs/s; movimento contínuo até o alvo", boat_obstacle_jump = "Pular obstáculos", boat_obstacle_jump_desc = "segurando frente, se o barco travar, sobe e depois volta à altura configurada", boat_obstacle_delay = "Tempo parado", boat_obstacle_delay_desc = "0,2 - 5 segundos parado antes de subir", boat_obstacle_speed = "Limite de velocidade parado", boat_obstacle_speed_desc = "0 - 150 studs/s físicos enquanto frente está pressionada", boat_obstacle_extra = "Altura extra no obstáculo", boat_obstacle_extra_desc = "20 - 300 studs adicionais enquanto estiver travado", boat_obstacle_rise = "Velocidade de subida", boat_obstacle_rise_desc = "50 - 500 studs/s; sobe sem teleporte", boat_obstacle_return = "Velocidade de retorno", boat_obstacle_return_desc = "50 - 500 studs/s de volta à altura de flutuação", boat_restore_float_desc = "limpa somente a altura de flutuação escolhida", boat_status_no_boat = "Sente no VehicleSeat principal do seu barco para configurá-lo.", boat_status_ready = "%s · assento de piloto ativo", boat_status_waiting = "%s · aguardando assento de piloto", boat_status_lift = "Flutuação +%.0f · obstáculo +%.0f",
+        },
+        ["es"] = {
+            boat_local = "BARCO LOCAL", boat_float = "FLOTAR", boat_general_apply = "Aplicar ajustes generales", boat_general_apply_desc = "solo cambia los valores de controles que modificaste", boat_speed = "Velocidad del barco", boat_speed_desc = "40 - 400; muestra el valor del juego hasta moverlo", boat_torque = "Torque de dirección", boat_torque_desc = "1 - 20; valores altos giran con más fuerza", boat_turn_speed = "Velocidad de giro", boat_turn_speed_desc = "0.01 - 12; respuesta nativa del asiento", boat_restore_default = "RESTAURAR VALORES DEL JUEGO", boat_restore_general_desc = "borra ajustes de velocidad, torque y giro", boat_float_apply = "Activar flotación", boat_float_apply_desc = "solo cambia soporte vertical al elegir un valor", boat_float_height = "Altura de flotación", boat_float_height_desc = "0 - 500 studs sobre la altura normal", boat_vertical_rate = "Velocidad vertical", boat_vertical_rate_desc = "20 - 300 studs/s; movimiento continuo", boat_obstacle_jump = "Saltar obstáculos", boat_obstacle_jump_desc = "al mantener adelante y bloquearse, sube y luego vuelve", boat_obstacle_delay = "Tiempo detenido", boat_obstacle_delay_desc = "0.2 - 5 segundos antes de subir", boat_obstacle_speed = "Umbral de parado", boat_obstacle_speed_desc = "0 - 150 studs/s físicos mientras avanzas", boat_obstacle_extra = "Altura extra", boat_obstacle_extra_desc = "20 - 300 studs adicionales", boat_obstacle_rise = "Velocidad de subida", boat_obstacle_rise_desc = "50 - 500 studs/s sin teletransporte", boat_obstacle_return = "Velocidad de retorno", boat_obstacle_return_desc = "50 - 500 studs/s de vuelta", boat_restore_float_desc = "borra solo la altura elegida", boat_status_no_boat = "Siéntate en el VehicleSeat principal de tu barco.", boat_status_ready = "%s · asiento de piloto activo", boat_status_waiting = "%s · esperando asiento", boat_status_lift = "Flotación +%.0f · obstáculo +%.0f",
+        },
+        ["vi"] = {
+            boat_local = "THUYỀN CỤC BỘ", boat_float = "NỔI", boat_general_apply = "Áp dụng cài đặt chung", boat_general_apply_desc = "chỉ đổi các thanh bạn đã chỉnh", boat_speed = "Tốc độ thuyền", boat_speed_desc = "40 - 400; giữ mặc định game cho tới khi chỉnh", boat_torque = "Lực lái", boat_torque_desc = "1 - 20; giá trị cao quay chắc hơn", boat_turn_speed = "Tốc độ quay", boat_turn_speed_desc = "0.01 - 12; phản hồi ghế gốc", boat_restore_default = "KHÔI PHỤC MẶC ĐỊNH", boat_restore_general_desc = "xóa chỉnh tốc độ, lực và quay", boat_float_apply = "Bật nổi", boat_float_apply_desc = "chỉ đổi hỗ trợ dọc sau khi chọn độ cao", boat_float_height = "Độ cao nổi", boat_float_height_desc = "0 - 500 studs trên độ cao gốc", boat_vertical_rate = "Tốc độ dọc", boat_vertical_rate_desc = "20 - 300 studs/s; di chuyển liên tục", boat_obstacle_jump = "Vượt chướng ngại", boat_obstacle_jump_desc = "giữ tiến, nếu bị kẹt thì lên rồi trở lại", boat_obstacle_delay = "Thời gian kẹt", boat_obstacle_delay_desc = "0.2 - 5 giây trước khi lên", boat_obstacle_speed = "Ngưỡng đứng yên", boat_obstacle_speed_desc = "0 - 150 studs/s khi giữ tiến", boat_obstacle_extra = "Độ cao thêm", boat_obstacle_extra_desc = "20 - 300 studs thêm", boat_obstacle_rise = "Tốc độ lên", boat_obstacle_rise_desc = "50 - 500 studs/s không dịch chuyển tức thời", boat_obstacle_return = "Tốc độ về", boat_obstacle_return_desc = "50 - 500 studs/s trở về", boat_restore_float_desc = "chỉ xóa độ cao đã chọn", boat_status_no_boat = "Ngồi vào VehicleSeat chính của thuyền.", boat_status_ready = "%s · ghế lái hoạt động", boat_status_waiting = "%s · đang chờ ghế lái", boat_status_lift = "Nổi +%.0f · chướng ngại +%.0f",
+        },
+    }
+    for code, entries in pairs(boatLocalLabels) do
+        for key, value in pairs(entries) do
+            Language.Translations[code][key] = value
+        end
+    end
+
     local combatSettingsLabels = {
         ["en"] = {combat = "COMBAT", auto_attack_mobs = "Auto Attack Mobs", auto_attack_mobs_desc = "attack every nearby NPC with your equipped Fighting Style or Sword", auto_attack_players = "Auto Attack Players", auto_attack_players_desc = "attack every nearby player with your equipped Fighting Style or Sword"},
         ["pt-BR"] = {combat = "COMBATE", auto_attack_mobs = "Auto Ataque Mobs", auto_attack_mobs_desc = "ataca todo NPC próximo com seu Estilo de Luta ou Espada equipado", auto_attack_players = "Auto Ataque Jogadores", auto_attack_players_desc = "ataca todo jogador próximo com seu Estilo de Luta ou Espada equipado"},
@@ -12622,6 +16483,38 @@ end)(Flow)
         end
     end
 
+    local espLabels = {
+        ["en"] = {
+            esp = "ESP", esp_targets = "TARGETS", esp_style = "STYLE", esp_master = "Enable ESP", esp_master_desc = "Show the selected targets.", esp_advanced_mode = "Advanced Mode", esp_advanced_mode_desc = "Show color and style options.", esp_local_only = "Choose what you want to see.", esp_active_targets = "%d targets found", esp_unlimited = "UNLIMITED",
+            esp_color = "Color", esp_color_desc = "Choose the color for this target.", esp_enable_type = "Enable %s", esp_enable_type_desc = "Show %s when available.", esp_show_name = "Show Name", esp_show_name_desc = "Show the name above the target.", esp_show_distance = "Show Distance", esp_show_distance_desc = "Show how far away it is.", esp_show_health = "Show Health", esp_show_health_desc = "Show the target health.", esp_highlight = "Highlight", esp_highlight_desc = "Make the target easier to see.", esp_box = "Box", esp_box_desc = "Draw a box around the target.", esp_tracer = "Tracer", esp_tracer_desc = "Draw a line to the target.",
+            esp_max_distance = "Maximum Distance", esp_max_distance_desc = "Hide targets that are too far away.", esp_text_size = "Label Size", esp_text_size_desc = "Make names larger or smaller.", esp_text_outline = "Text Outline", esp_text_outline_desc = "Make names easier to read.", esp_fill_transparency = "Highlight Fill", esp_fill_transparency_desc = "Adjust the color inside the target.", esp_outline_transparency = "Highlight Outline", esp_outline_transparency_desc = "Adjust the edge of the highlight.", esp_box_thickness = "Box Thickness", esp_box_thickness_desc = "Make the box thicker or thinner.", esp_box_transparency = "Box Transparency", esp_box_transparency_desc = "Adjust how clear the box is.", esp_tracer_thickness = "Tracer Thickness", esp_tracer_thickness_desc = "Make the line thicker or thinner.", esp_tracer_transparency = "Tracer Transparency", esp_tracer_transparency_desc = "Adjust how clear the line is.", esp_tracer_origin = "Tracer Origin", esp_tracer_origin_desc = "Choose where the line starts.", esp_origin_bottom = "BOTTOM", esp_origin_center = "CENTER", esp_refresh_rate = "Update Speed", esp_refresh_rate_desc = "How quickly ESP looks for new targets.",
+            esp_type_fruit = "Fruits", esp_type_islands = "Islands", esp_type_players = "Players", esp_type_bosses = "Bosses", esp_type_chests = "Chests", esp_type_race_v2 = "Race V2 Flowers", esp_type_berries = "Berries", esp_type_haki = "Haki & useful NPCs", esp_type_special = "Special events",
+        },
+        ["pt-BR"] = {
+            esp = "ESP", esp_targets = "ALVOS", esp_style = "ESTILO", esp_master = "Ativar ESP", esp_master_desc = "Mostra os alvos escolhidos.", esp_advanced_mode = "Modo avançado", esp_advanced_mode_desc = "Mostra opções de cor e estilo.", esp_local_only = "Escolha o que você quer ver.", esp_active_targets = "%d alvos encontrados", esp_unlimited = "ILIMITADA",
+            esp_color = "Cor", esp_color_desc = "Escolha a cor deste alvo.", esp_enable_type = "Ativar %s", esp_enable_type_desc = "Mostra %s quando aparecerem.", esp_show_name = "Mostrar nome", esp_show_name_desc = "Mostra o nome acima do alvo.", esp_show_distance = "Mostrar distância", esp_show_distance_desc = "Mostra o quão longe está.", esp_show_health = "Mostrar vida", esp_show_health_desc = "Mostra a vida do alvo.", esp_highlight = "Highlight", esp_highlight_desc = "Deixa o alvo mais fácil de ver.", esp_box = "Caixa", esp_box_desc = "Desenha uma caixa no alvo.", esp_tracer = "Tracer", esp_tracer_desc = "Desenha uma linha até o alvo.",
+            esp_max_distance = "Distância máxima", esp_max_distance_desc = "Oculta alvos que estão muito longe.", esp_text_size = "Tamanho do nome", esp_text_size_desc = "Deixa os nomes maiores ou menores.", esp_text_outline = "Contorno do texto", esp_text_outline_desc = "Deixa os nomes mais fáceis de ler.", esp_fill_transparency = "Preenchimento do highlight", esp_fill_transparency_desc = "Ajusta a cor dentro do alvo.", esp_outline_transparency = "Contorno do highlight", esp_outline_transparency_desc = "Ajusta a borda do highlight.", esp_box_thickness = "Espessura da caixa", esp_box_thickness_desc = "Deixa a caixa mais grossa ou fina.", esp_box_transparency = "Transparência da caixa", esp_box_transparency_desc = "Ajusta o quanto a caixa aparece.", esp_tracer_thickness = "Espessura do tracer", esp_tracer_thickness_desc = "Deixa a linha mais grossa ou fina.", esp_tracer_transparency = "Transparência do tracer", esp_tracer_transparency_desc = "Ajusta o quanto a linha aparece.", esp_tracer_origin = "Origem do tracer", esp_tracer_origin_desc = "Escolha onde a linha começa.", esp_origin_bottom = "EMBAIXO", esp_origin_center = "CENTRO", esp_refresh_rate = "Velocidade de busca", esp_refresh_rate_desc = "Define a rapidez para achar novos alvos.",
+            esp_type_fruit = "Frutas", esp_type_islands = "Ilhas", esp_type_players = "Jogadores", esp_type_bosses = "Bosses", esp_type_chests = "Baús", esp_type_race_v2 = "Flores Race V2", esp_type_berries = "Berries", esp_type_haki = "Haki e NPCs úteis", esp_type_special = "Eventos especiais",
+        },
+        ["es"] = {
+            esp = "ESP", esp_targets = "OBJETIVOS", esp_style = "ESTILO", esp_master = "Activar ESP", esp_master_desc = "Muestra los objetivos elegidos.", esp_advanced_mode = "Modo avanzado", esp_advanced_mode_desc = "Muestra opciones de color y estilo.", esp_local_only = "Elige lo que quieres ver.", esp_active_targets = "%d objetivos encontrados", esp_unlimited = "ILIMITADA",
+            esp_color = "Color", esp_color_desc = "Elige el color de este objetivo.", esp_enable_type = "Activar %s", esp_enable_type_desc = "Muestra %s cuando aparezcan.", esp_show_name = "Mostrar nombre", esp_show_name_desc = "Muestra el nombre sobre el objetivo.", esp_show_distance = "Mostrar distancia", esp_show_distance_desc = "Muestra qué tan lejos está.", esp_show_health = "Mostrar vida", esp_show_health_desc = "Muestra la vida del objetivo.", esp_highlight = "Resaltado", esp_highlight_desc = "Hace el objetivo más fácil de ver.", esp_box = "Caja", esp_box_desc = "Dibuja una caja en el objetivo.", esp_tracer = "Trazador", esp_tracer_desc = "Dibuja una línea hasta el objetivo.",
+            esp_max_distance = "Distancia máxima", esp_max_distance_desc = "Oculta objetivos muy lejanos.", esp_text_size = "Tamaño del nombre", esp_text_size_desc = "Hace los nombres más grandes o pequeños.", esp_text_outline = "Contorno de texto", esp_text_outline_desc = "Hace los nombres más fáciles de leer.", esp_fill_transparency = "Relleno del resaltado", esp_fill_transparency_desc = "Ajusta el color dentro del objetivo.", esp_outline_transparency = "Contorno del resaltado", esp_outline_transparency_desc = "Ajusta el borde del resaltado.", esp_box_thickness = "Grosor de caja", esp_box_thickness_desc = "Hace la caja más gruesa o fina.", esp_box_transparency = "Transparencia de caja", esp_box_transparency_desc = "Ajusta cuánto se ve la caja.", esp_tracer_thickness = "Grosor del trazador", esp_tracer_thickness_desc = "Hace la línea más gruesa o fina.", esp_tracer_transparency = "Transparencia del trazador", esp_tracer_transparency_desc = "Ajusta cuánto se ve la línea.", esp_tracer_origin = "Origen del trazador", esp_tracer_origin_desc = "Elige dónde empieza la línea.", esp_origin_bottom = "ABAJO", esp_origin_center = "CENTRO", esp_refresh_rate = "Velocidad de búsqueda", esp_refresh_rate_desc = "Define la rapidez para encontrar objetivos.",
+            esp_type_fruit = "Frutas", esp_type_islands = "Islas", esp_type_players = "Jugadores", esp_type_bosses = "Jefes", esp_type_chests = "Cofres", esp_type_race_v2 = "Flores Race V2", esp_type_berries = "Bayas", esp_type_haki = "Haki y NPC útiles", esp_type_special = "Eventos especiales",
+        },
+        ["vi"] = {
+            esp = "ESP", esp_targets = "MỤC TIÊU", esp_style = "KIỂU HIỂN THỊ", esp_master = "Bật ESP", esp_master_desc = "Hiện các mục tiêu đã chọn.", esp_advanced_mode = "Chế độ nâng cao", esp_advanced_mode_desc = "Hiện tùy chọn màu và kiểu.", esp_local_only = "Chọn thứ bạn muốn xem.", esp_active_targets = "%d mục tiêu đã tìm thấy", esp_unlimited = "KHÔNG GIỚI HẠN",
+            esp_color = "Màu", esp_color_desc = "Chọn màu cho mục tiêu này.", esp_enable_type = "Bật %s", esp_enable_type_desc = "Hiện %s khi xuất hiện.", esp_show_name = "Hiện tên", esp_show_name_desc = "Hiện tên trên mục tiêu.", esp_show_distance = "Hiện khoảng cách", esp_show_distance_desc = "Hiện khoảng cách tới mục tiêu.", esp_show_health = "Hiện máu", esp_show_health_desc = "Hiện máu của mục tiêu.", esp_highlight = "Highlight", esp_highlight_desc = "Giúp mục tiêu dễ thấy hơn.", esp_box = "Khung", esp_box_desc = "Vẽ khung quanh mục tiêu.", esp_tracer = "Đường chỉ", esp_tracer_desc = "Vẽ đường tới mục tiêu.",
+            esp_max_distance = "Khoảng cách tối đa", esp_max_distance_desc = "Ẩn mục tiêu ở quá xa.", esp_text_size = "Cỡ tên", esp_text_size_desc = "Làm tên to hơn hoặc nhỏ hơn.", esp_text_outline = "Viền chữ", esp_text_outline_desc = "Giúp tên dễ đọc hơn.", esp_fill_transparency = "Phần tô highlight", esp_fill_transparency_desc = "Chỉnh màu bên trong mục tiêu.", esp_outline_transparency = "Viền highlight", esp_outline_transparency_desc = "Chỉnh viền highlight.", esp_box_thickness = "Độ dày khung", esp_box_thickness_desc = "Làm khung dày hoặc mỏng hơn.", esp_box_transparency = "Độ trong khung", esp_box_transparency_desc = "Chỉnh độ rõ của khung.", esp_tracer_thickness = "Độ dày đường", esp_tracer_thickness_desc = "Làm đường dày hoặc mỏng hơn.", esp_tracer_transparency = "Độ trong đường", esp_tracer_transparency_desc = "Chỉnh độ rõ của đường.", esp_tracer_origin = "Gốc đường chỉ", esp_tracer_origin_desc = "Chọn nơi đường bắt đầu.", esp_origin_bottom = "DƯỚI", esp_origin_center = "GIỮA", esp_refresh_rate = "Tốc độ tìm", esp_refresh_rate_desc = "Chỉnh tốc độ tìm mục tiêu mới.",
+            esp_type_fruit = "Trái cây", esp_type_islands = "Đảo", esp_type_players = "Người chơi", esp_type_bosses = "Boss", esp_type_chests = "Rương", esp_type_race_v2 = "Hoa Race V2", esp_type_berries = "Quả mọng", esp_type_haki = "Haki và NPC hữu ích", esp_type_special = "Sự kiện đặc biệt",
+        },
+    }
+    for code, entries in pairs(espLabels) do
+        for key, value in pairs(entries) do
+            Language.Translations[code][key] = value
+        end
+    end
+
     local farmLabels = {
         ["en"] = {
             farm = "Farm", raid_monitor = "Raid Monitor", raid_monitor_desc = "passively records a user-started island raid; no actions or Remotes", raid_monitor_active_value = "observing raid · %d mobs · %d events", raid_monitor_waiting_value = "waiting for a user-started raid · %d events", raid_monitor_idle_value = "monitor idle", farm_settings = "Settings", farm_level = "Farm Level", farm_level_desc = "automatically follows the current level quest up to level 2800", farm_weapon = "Weapon Type", farm_weapon_desc = "choose one combat category for every farm attack", farm_select_weapon = "SELECT WEAPON TYPE", farm_refresh_weapons = "REFRESH", farm_no_weapon = "No weapon type selected", farm_weapon_missing = "selected weapon type not found", farm_fighting_style = "Fighting Style", farm_fighting_style_desc = "use the equipped fighting style", farm_sword = "Sword", farm_sword_desc = "use an equipped sword", farm_cap_confirm_title = "Do you really want to enable this option?", farm_cap_confirm_message = "You are already at the maximum level available to this script. Enabling it will only farm the final level-2800 quest.", farm_cap_confirm_cancel = "CANCEL", farm_cap_confirm_activate = "ENABLE",
@@ -12707,6 +16600,20 @@ end)(Flow)
         end
     end
 
+    -- Sea Events > Farm labels. These are separate from the manual BoatLocal
+    -- labels so the two controllers remain visibly distinct in the Hub.
+    local eventFarmLabels = {
+        ["en"] = {event_farm = "FARM", event_farm_title = "EVENT FARM", auto_farm_events = "Auto Farm Events", auto_farm_events_desc = "buys the selected boat, follows the open-sea route and farms selected events", event_farm_boat = "Boat", event_farm_boat_desc = "select exactly one boat from the live BoatInfo catalogue", event_farm_event = "Farmable event", event_farm_event_desc = "select the maritime event to look for", event_farm_choose_boat = "Choose a boat", event_farm_choose_event = "Choose an event", event_farm_no_boats = "No boat catalogue is available in this server", event_farm_no_selection = "Not selected", event_farm_vortex = "Dodge Terrorshark suction attacks", event_farm_vortex_desc = "uses the passive Vortex prediction and returns to combat after its damage window", event_farm_move_boat = "Move boat away while farming Terrorshark", event_farm_move_boat_desc = "parks your boat at a safe distance; never takes the helm from another player", event_farm_status = "Farm status", event_farm_catalogue = "%d boats mapped in the live catalogue"},
+        ["pt-BR"] = {event_farm = "FARM", event_farm_title = "FARM DE EVENTOS", auto_farm_events = "Auto Farm Eventos", auto_farm_events_desc = "compra o barco escolhido, segue a rota de mar aberto e farma os eventos selecionados", event_farm_boat = "Barco", event_farm_boat_desc = "selecione exatamente um barco do catálogo ao vivo BoatInfo", event_farm_event = "Evento farmável", event_farm_event_desc = "selecione o evento marítimo que será procurado", event_farm_choose_boat = "Escolher barco", event_farm_choose_event = "Escolher evento", event_farm_no_boats = "O catálogo de barcos não está disponível neste servidor", event_farm_no_selection = "Não selecionado", event_farm_vortex = "Desviar ataques de sucção Terrorshark", event_farm_vortex_desc = "usa a previsão passiva do Vortex e volta ao combate após a janela de dano", event_farm_move_boat = "Afastar barco no farm Terrorshark", event_farm_move_boat_desc = "estaciona seu barco em distância segura; nunca toma o leme de outro jogador", event_farm_status = "Estado do farm", event_farm_catalogue = "%d barcos mapeados no catálogo ao vivo"},
+        ["es"] = {event_farm = "FARM", event_farm_title = "FARM DE EVENTOS", auto_farm_events = "Auto Farm Eventos", auto_farm_events_desc = "compra el barco elegido, sigue la ruta de mar abierto y farmea los eventos seleccionados", event_farm_boat = "Barco", event_farm_boat_desc = "selecciona exactamente un barco del catálogo BoatInfo en vivo", event_farm_event = "Evento farmeable", event_farm_event_desc = "selecciona el evento marítimo que se buscará", event_farm_choose_boat = "Elegir barco", event_farm_choose_event = "Elegir evento", event_farm_no_boats = "El catálogo de barcos no está disponible en este servidor", event_farm_no_selection = "Sin seleccionar", event_farm_vortex = "Esquivar ataques de succión de Terrorshark", event_farm_vortex_desc = "usa la predicción pasiva de Vortex y vuelve al combate tras la ventana de daño", event_farm_move_boat = "Alejar barco al farmear Terrorshark", event_farm_move_boat_desc = "estaciona tu barco a distancia segura; nunca toma el timón de otro jugador", event_farm_status = "Estado del farm", event_farm_catalogue = "%d barcos mapeados en el catálogo en vivo"},
+        ["vi"] = {event_farm = "FARM", event_farm_title = "FARM SỰ KIỆN", auto_farm_events = "Tự Động Farm Sự Kiện", auto_farm_events_desc = "mua thuyền đã chọn, theo tuyến biển mở và farm sự kiện đã chọn", event_farm_boat = "Thuyền", event_farm_boat_desc = "chọn đúng một thuyền từ danh mục BoatInfo trực tiếp", event_farm_event = "Sự kiện có thể farm", event_farm_event_desc = "chọn sự kiện biển để tìm", event_farm_choose_boat = "Chọn thuyền", event_farm_choose_event = "Chọn sự kiện", event_farm_no_boats = "Danh mục thuyền không có trong máy chủ này", event_farm_no_selection = "Chưa chọn", event_farm_vortex = "Né đòn hút của Terrorshark", event_farm_vortex_desc = "dùng dự đoán Vortex thụ động và trở lại chiến đấu sau cửa sổ sát thương", event_farm_move_boat = "Đưa thuyền ra xa khi farm Terrorshark", event_farm_move_boat_desc = "đỗ thuyền ở khoảng cách an toàn; không bao giờ cướp lái từ người khác", event_farm_status = "Trạng thái farm", event_farm_catalogue = "%d thuyền đã lập bản đồ trong danh mục trực tiếp"},
+    }
+    for code, entries in pairs(eventFarmLabels) do
+        for key, value in pairs(entries) do
+            Language.Translations[code][key] = value
+        end
+    end
+
     function Language:GetCode()
         local code = Flow.State.language
         return self.Translations[code] and code or "en"
@@ -12738,6 +16645,7 @@ end)(Flow)
     local State = Flow.State
     local Config = Flow.Config
     local Finder = Flow.Features.FruitFinder
+    local ESP = Flow.Features.ESP
     local Portal = Flow.Features.Portal
     local WorldPortals = Flow.Features.WorldPortals
     local Teleport = Flow.Features.Teleport
@@ -12852,6 +16760,628 @@ end)(Flow)
             row.BackgroundColor3 = Theme.panel2
         end)
         return row, box
+    end
+
+    local function buildBoatLocalPage(boatPage, gui, lucide, t, setStatus, subButton, sectionHeader)
+        local Boat = Flow.Features.BoatLocal
+        local function list(parent)
+            local scrolling = Theme.New("ScrollingFrame", {
+                -- General and Float are types within Boat Local, not pages.
+                -- They share this single scroll surface below the parent title.
+                Size = UDim2.new(1, 0, 1, -34), Position = UDim2.new(0, 0, 0, 34),
+                BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
+                ScrollBarImageColor3 = Theme.accent, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+                CanvasSize = UDim2.new(), Parent = parent,
+            })
+            local layout = Instance.new("UIListLayout")
+            layout.Padding = UDim.new(0, 7)
+            layout.SortOrder = Enum.SortOrder.LayoutOrder
+            layout.Parent = scrolling
+            local padding = Instance.new("UIPadding")
+            padding.PaddingRight = UDim.new(0, 5)
+            padding.PaddingBottom = UDim.new(0, 7)
+            padding.Parent = scrolling
+            return scrolling
+        end
+
+        local function sliderRow(parent, title, description, minimum, maximum, initial, formatter, callback, iconAssetPath)
+            local row = frame(parent, {Size = UDim2.new(1, 0, 0, 76), BackgroundColor3 = Theme.panel2}, 8)
+            Theme.Stroke(row, Theme.border, 1, 0)
+            frame(row, {Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8), BackgroundColor3 = Theme.accent}, 2)
+            local hasIcon = iconAssetPath and iconAssetPath ~= ""
+            if hasIcon then
+                Theme.New("ImageLabel", {Size = UDim2.new(0, 15, 0, 15), Position = UDim2.new(0, 13, 0, 10), BackgroundTransparency = 1, Image = iconAssetPath, ImageColor3 = Theme.accent2, ScaleType = Enum.ScaleType.Fit, Parent = row})
+            end
+            local left = hasIcon and 35 or 13
+            label(row, {Size = UDim2.new(1, -112, 0, 18), Position = UDim2.new(0, left, 0, 8), Text = title, TextSize = 12, Font = Enum.Font.GothamBold})
+            label(row, {Size = UDim2.new(1, -32, 0, 16), Position = UDim2.new(0, left, 0, 28), Text = description, TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd})
+            local value = label(row, {Size = UDim2.new(0, 94, 0, 18), Position = UDim2.new(1, -105, 0, 8), Text = "", TextSize = 10, Font = Enum.Font.GothamBold, TextColor3 = Theme.accent2, TextXAlignment = Enum.TextXAlignment.Right})
+            local control
+            control = Theme.Slider(row, initial, minimum, maximum, function(raw)
+                local result = callback and callback(raw) or raw
+                if result ~= nil and control then control:Set(result, true) end
+                value.Text = formatter(result or raw)
+            end)
+            control.Frame.Size = UDim2.new(1, -38, 0, 6)
+            control.Frame.Position = UDim2.new(0, 17, 1, -15)
+            control:Set(initial, true)
+            value.Text = formatter(initial)
+            return {row = row, control = control, value = value, formatter = formatter}
+        end
+
+        sectionHeader(boatPage, t("boat_local"), "")
+        local boatList = list(boatPage)
+        local order = 0
+        local function nextOrder()
+            order = order + 1
+            return order
+        end
+        local function typeHeader(title, explanation, spacedAbove)
+            -- A type that follows another group receives breathing room before
+            -- its title, while the first/default content starts immediately.
+            if spacedAbove then
+                frame(boatList, {
+                    Size = UDim2.new(1, 0, 0, 16),
+                    BackgroundTransparency = 1,
+                    LayoutOrder = nextOrder(),
+                })
+            end
+            -- Match the parent "BARCO LOCAL" section treatment: accent rail,
+            -- 18 px GothamBold title, then a short explanation below it.
+            local header = frame(boatList, {
+                Size = UDim2.new(1, -4, 0, 54),
+                BackgroundTransparency = 1,
+                LayoutOrder = nextOrder(),
+            })
+            frame(header, {
+                Size = UDim2.new(0, 3, 0, 24),
+                Position = UDim2.new(0, 0, 0, 0),
+                BackgroundColor3 = Theme.accent,
+            }, 2)
+            label(header, {
+                Size = UDim2.new(1, -10, 0, 24),
+                Position = UDim2.new(0, 10, 0, 0),
+                Text = title,
+                TextSize = 18,
+                Font = Enum.Font.GothamBold,
+            })
+            label(header, {
+                Size = UDim2.new(1, -10, 0, 24),
+                Position = UDim2.new(0, 10, 0, 28),
+                Text = explanation,
+                TextSize = 10,
+                TextColor3 = Theme.muted,
+                TextWrapped = true,
+                TextYAlignment = Enum.TextYAlignment.Top,
+            })
+        end
+
+        -- General is the default Boat Local content, so it does not repeat
+        -- the parent title as a second "GENERAL" heading.
+        local generalStatus = label(boatList, {Size = UDim2.new(1, -4, 0, 32), Text = t("boat_status_no_boat"), TextSize = 10, TextColor3 = Theme.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Center, LayoutOrder = nextOrder()})
+        local generalRow, generalToggle = Theme.OptionRow(boatList, t("boat_general_apply"), t("boat_general_apply_desc"), function(active)
+            if Boat then Boat:SetGeneralEnabled(active) end
+        end, lucide.maritime or lucide.speed)
+        generalRow.LayoutOrder = nextOrder()
+        local speedRow = sliderRow(boatList, t("boat_speed"), t("boat_speed_desc"), 40, 400, 142.5, function(value) return string.format("%.0f", value) end, function(value)
+            return Boat and Boat:SetNumber("speed", value) or value
+        end, lucide.speed)
+        speedRow.row.LayoutOrder = nextOrder()
+        local torqueRow = sliderRow(boatList, t("boat_torque"), t("boat_torque_desc"), 1, 20, 4, function(value) return string.format("%.1f", value) end, function(value)
+            return Boat and Boat:SetNumber("torque", value) or value
+        end, lucide.settings)
+        torqueRow.row.LayoutOrder = nextOrder()
+        local turnRow = sliderRow(boatList, t("boat_turn_speed"), t("boat_turn_speed_desc"), 0.01, 12, 1, function(value) return string.format("%.1f", value) end, function(value)
+            return Boat and Boat:SetNumber("turnSpeed", value) or value
+        end, lucide.rotate or lucide.settings)
+        turnRow.row.LayoutOrder = nextOrder()
+        local resetGeneral = button(boatList, t("boat_restore_default"), Theme.panel3, 7, lucide.refresh)
+        resetGeneral.Size = UDim2.new(1, -2, 0, 30)
+        resetGeneral.TextSize = 9
+        resetGeneral.LayoutOrder = nextOrder()
+
+        -- Type: Float. This is a second titled group in the same scroll view,
+        -- not a second page, so all Boat Local controls stay in one context.
+        typeHeader(t("boat_float"), t("boat_float_apply_desc"), true)
+        local floatStatus = label(boatList, {Size = UDim2.new(1, -4, 0, 32), Text = t("boat_status_no_boat"), TextSize = 10, TextColor3 = Theme.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Center, LayoutOrder = nextOrder()})
+        local floatRow, floatToggle = Theme.OptionRow(boatList, t("boat_float_apply"), t("boat_float_apply_desc"), function(active)
+            if Boat then Boat:SetFloatEnabled(active) end
+        end, lucide.maritime or lucide.speed)
+        floatRow.LayoutOrder = nextOrder()
+        local heightRow = sliderRow(boatList, t("boat_float_height"), t("boat_float_height_desc"), 0, 500, 0, function(value) return string.format("%.0f", value) end, function(value)
+            return Boat and Boat:SetNumber("height", value) or value
+        end, lucide.speed)
+        heightRow.row.LayoutOrder = nextOrder()
+        local verticalRow = sliderRow(boatList, t("boat_vertical_rate"), t("boat_vertical_rate_desc"), 20, 300, 100, function(value) return string.format("%.0f/s", value) end, function(value)
+            return Boat and Boat:SetNumber("verticalRate", value) or value
+        end, lucide.speed)
+        verticalRow.row.LayoutOrder = nextOrder()
+        local obstacleRow, obstacleToggle = Theme.OptionRow(boatList, t("boat_obstacle_jump"), t("boat_obstacle_jump_desc"), function(active)
+            if Boat then Boat:SetObstacleEnabled(active) end
+        end, lucide.accent or lucide.speed)
+        obstacleRow.LayoutOrder = nextOrder()
+        local delayRow = sliderRow(boatList, t("boat_obstacle_delay"), t("boat_obstacle_delay_desc"), 0.2, 5, 1, function(value) return string.format("%.1fs", value) end, function(value)
+            return Boat and Boat:SetNumber("obstacleDelay", value) or value
+        end, lucide.timer)
+        delayRow.row.LayoutOrder = nextOrder()
+        local stoppedRow = sliderRow(boatList, t("boat_obstacle_speed"), t("boat_obstacle_speed_desc"), 0, 150, 18, function(value) return string.format("%.0f", value) end, function(value)
+            return Boat and Boat:SetNumber("obstacleSpeed", value) or value
+        end, lucide.gauge or lucide.speed)
+        stoppedRow.row.LayoutOrder = nextOrder()
+        local extraRow = sliderRow(boatList, t("boat_obstacle_extra"), t("boat_obstacle_extra_desc"), 20, 300, 80, function(value) return string.format("%.0f", value) end, function(value)
+            return Boat and Boat:SetNumber("obstacleExtra", value) or value
+        end, lucide.speed)
+        extraRow.row.LayoutOrder = nextOrder()
+        local riseRow = sliderRow(boatList, t("boat_obstacle_rise"), t("boat_obstacle_rise_desc"), 50, 500, 220, function(value) return string.format("%.0f/s", value) end, function(value)
+            return Boat and Boat:SetNumber("obstacleRise", value) or value
+        end, lucide.speed)
+        riseRow.row.LayoutOrder = nextOrder()
+        local returnRow = sliderRow(boatList, t("boat_obstacle_return"), t("boat_obstacle_return_desc"), 50, 500, 260, function(value) return string.format("%.0f/s", value) end, function(value)
+            return Boat and Boat:SetNumber("obstacleReturn", value) or value
+        end, lucide.speed)
+        returnRow.row.LayoutOrder = nextOrder()
+        local resetFloat = button(boatList, t("boat_restore_default"), Theme.panel3, 7, lucide.refresh)
+        resetFloat.Size = UDim2.new(1, -2, 0, 30)
+        resetFloat.TextSize = 9
+        resetFloat.LayoutOrder = nextOrder()
+
+        local function refresh()
+            if not Boat then return end
+            local snapshot = Boat:GetSnapshot()
+            local status
+            if not snapshot.boatName then
+                status = t("boat_status_no_boat")
+            elseif snapshot.driver then
+                status = t("boat_status_ready", snapshot.boatName)
+            else
+                status = t("boat_status_waiting", snapshot.boatName)
+            end
+            generalStatus.Text = status
+            floatStatus.Text = status .. " · " .. t("boat_status_lift", snapshot.activeLift or 0, snapshot.obstacleLift or 0)
+            generalToggle:Set(snapshot.generalEnabled, true)
+            floatToggle:Set(snapshot.floatEnabled, true)
+            obstacleToggle:Set(snapshot.obstacleEnabled, true)
+            speedRow.control:Set(snapshot.speed, true); speedRow.value.Text = speedRow.formatter(snapshot.speed)
+            torqueRow.control:Set(snapshot.torque, true); torqueRow.value.Text = torqueRow.formatter(snapshot.torque)
+            turnRow.control:Set(snapshot.turnSpeed, true); turnRow.value.Text = turnRow.formatter(snapshot.turnSpeed)
+            heightRow.control:Set(snapshot.height, true); heightRow.value.Text = heightRow.formatter(snapshot.height)
+            verticalRow.control:Set(snapshot.verticalRate, true); verticalRow.value.Text = verticalRow.formatter(snapshot.verticalRate)
+            delayRow.control:Set(snapshot.obstacleDelay, true); delayRow.value.Text = delayRow.formatter(snapshot.obstacleDelay)
+            stoppedRow.control:Set(snapshot.obstacleSpeed, true); stoppedRow.value.Text = stoppedRow.formatter(snapshot.obstacleSpeed)
+            extraRow.control:Set(snapshot.obstacleExtra, true); extraRow.value.Text = extraRow.formatter(snapshot.obstacleExtra)
+            riseRow.control:Set(snapshot.obstacleRise, true); riseRow.value.Text = riseRow.formatter(snapshot.obstacleRise)
+            returnRow.control:Set(snapshot.obstacleReturn, true); returnRow.value.Text = returnRow.formatter(snapshot.obstacleReturn)
+        end
+        resetGeneral.MouseButton1Click:Connect(function()
+            if Boat then Boat:ResetGeneralToGameDefault() end
+            refresh()
+            if setStatus then setStatus(t("saved"), Theme.success) end
+        end)
+        resetFloat.MouseButton1Click:Connect(function()
+            if Boat then Boat:ResetFloatToGameDefault() end
+            refresh()
+            if setStatus then setStatus(t("saved"), Theme.success) end
+        end)
+        task.spawn(function()
+            while gui and gui.Parent do
+                task.wait(0.35)
+                if boatPage.Visible then refresh() end
+            end
+        end)
+        refresh()
+        return {refresh = refresh}
+    end
+
+    local function buildEspPage(espPage, gui, lucide, t, setStatus, subButton, sectionHeader)
+        local Esp = Flow.Features.ESP
+        local function scrolling(parent)
+            local list = Theme.New("ScrollingFrame", {
+                Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+                ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.accent,
+                AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), Parent = parent,
+            })
+            local layout = Instance.new("UIListLayout")
+            layout.Padding = UDim.new(0, 7)
+            layout.SortOrder = Enum.SortOrder.LayoutOrder
+            layout.Parent = list
+            local padding = Instance.new("UIPadding")
+            padding.PaddingRight = UDim.new(0, 5)
+            padding.PaddingBottom = UDim.new(0, 8)
+            padding.Parent = list
+            return list
+        end
+
+        local saveToken = 0
+        local function saveSoon()
+            saveToken = saveToken + 1
+            local token = saveToken
+            task.delay(0.40, function()
+                if token == saveToken and Config then Config:Save() end
+            end)
+        end
+        local function updateVisuals()
+            if Esp and Esp.Refresh then Esp:Refresh() end
+            saveSoon()
+        end
+        local function title(parent, text, description)
+            local holder = frame(parent, {Size = UDim2.new(1, -4, 0, 45), BackgroundTransparency = 1}, 0)
+            frame(holder, {Size = UDim2.new(0, 3, 0, 23), Position = UDim2.new(0, 0, 0, 1), BackgroundColor3 = Theme.accent}, 2)
+            label(holder, {Size = UDim2.new(1, -12, 0, 22), Position = UDim2.new(0, 10, 0, 0), Text = text, TextSize = 15, Font = Enum.Font.GothamBold})
+            label(holder, {Size = UDim2.new(1, -12, 0, 16), Position = UDim2.new(0, 10, 0, 25), Text = description or "", TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd})
+            return holder
+        end
+        local function numberRow(parent, rowTitle, description, minimum, maximum, initial, formatter, callback)
+            local row = frame(parent, {Size = UDim2.new(1, 0, 0, 76), BackgroundColor3 = Theme.panel2}, 8)
+            Theme.Stroke(row, Theme.border, 1, 0)
+            frame(row, {Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8), BackgroundColor3 = Theme.accent}, 2)
+            label(row, {Size = UDim2.new(1, -118, 0, 18), Position = UDim2.new(0, 13, 0, 8), Text = rowTitle, TextSize = 12, Font = Enum.Font.GothamBold})
+            label(row, {Size = UDim2.new(1, -28, 0, 16), Position = UDim2.new(0, 13, 0, 28), Text = description, TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd})
+            local value = label(row, {Size = UDim2.new(0, 102, 0, 18), Position = UDim2.new(1, -112, 0, 8), Text = "", TextSize = 10, Font = Enum.Font.GothamBold, TextColor3 = Theme.accent2, TextXAlignment = Enum.TextXAlignment.Right})
+            local control
+            control = Theme.Slider(row, initial, minimum, maximum, function(raw)
+                local result = callback and callback(raw) or raw
+                if result ~= nil and control then control:Set(result, true) end
+                value.Text = formatter(result or raw)
+            end)
+            control.Frame.Size = UDim2.new(1, -38, 0, 6)
+            control.Frame.Position = UDim2.new(0, 17, 1, -15)
+            value.Text = formatter(initial)
+            return {control = control, value = value, formatter = formatter}
+        end
+        local function colorRow(parent, settings)
+            local row = frame(parent, {Size = UDim2.new(1, 0, 0, 66), BackgroundColor3 = Theme.panel2}, 8)
+            Theme.Stroke(row, Theme.border, 1, 0)
+            frame(row, {Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8), BackgroundColor3 = Theme.accent}, 2)
+            label(row, {Size = UDim2.new(0, 160, 0, 18), Position = UDim2.new(0, 13, 0, 8), Text = t("esp_color"), TextSize = 12, Font = Enum.Font.GothamBold})
+            label(row, {Size = UDim2.new(0, 180, 0, 15), Position = UDim2.new(0, 13, 0, 29), Text = t("esp_color_desc"), TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd})
+            local swatch = frame(row, {Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -34, 0, 9), BackgroundColor3 = Color3.fromRGB(settings.color[1], settings.color[2], settings.color[3])}, 5)
+            local boxes = {}
+            local labels = {"R", "G", "B"}
+            for index, channel in ipairs(labels) do
+                label(row, {Size = UDim2.new(0, 10, 0, 14), Position = UDim2.new(0, 208 + ((index - 1) * 72), 0, 35), Text = channel, TextSize = 9, TextColor3 = Theme.muted, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Center})
+                local box = textBox(row, settings.color[index])
+                box.Size = UDim2.new(0, 54, 0, 22)
+                box.Position = UDim2.new(0, 221 + ((index - 1) * 72), 0, 31)
+                box.TextSize = 9
+                boxes[index] = box
+                box.FocusLost:Connect(function()
+                    local value = tonumber(box.Text)
+                    if value then settings.color[index] = math.max(0, math.min(255, math.floor(value))) end
+                    box.Text = tostring(settings.color[index])
+                    swatch.BackgroundColor3 = Color3.fromRGB(settings.color[1], settings.color[2], settings.color[3])
+                    updateVisuals()
+                end)
+            end
+            return {row = row, refresh = function()
+                for index, box in ipairs(boxes) do box.Text = tostring(settings.color[index]) end
+                swatch.BackgroundColor3 = Color3.fromRGB(settings.color[1], settings.color[2], settings.color[3])
+            end}
+        end
+
+        sectionHeader(espPage, t("esp"), "")
+        local targetsTab = subButton(espPage, t("esp_targets"), 0, 94)
+        local styleTab = subButton(espPage, t("esp_style"), 100, 82)
+        targetsTab.BackgroundColor3 = Theme.accent
+        local status = label(espPage, {Size = UDim2.new(0, 170, 0, 26), Position = UDim2.new(1, -170, 0, 34), Text = "", TextSize = 10, TextColor3 = Theme.muted, TextXAlignment = Enum.TextXAlignment.Right, TextYAlignment = Enum.TextYAlignment.Center})
+        local targetsPage = Theme.New("Frame", {Size = UDim2.new(1, 0, 1, -70), Position = UDim2.new(0, 0, 0, 70), BackgroundTransparency = 1, Parent = espPage})
+        local stylePage = Theme.New("Frame", {Size = UDim2.new(1, 0, 1, -70), Position = UDim2.new(0, 0, 0, 70), BackgroundTransparency = 1, Visible = false, Parent = espPage})
+        local targetsList, styleList = scrolling(targetsPage), scrolling(stylePage)
+        local typeControls, styleControls, advancedRows = {}, {}, {}
+        local advancedToggle
+        local function applyAdvancedVisibility()
+            local active = State.espAdvancedMode == true
+            styleTab.Visible = active
+            for _, row in ipairs(advancedRows) do row.Visible = active end
+            if not active then
+                targetsPage.Visible, stylePage.Visible = true, false
+                targetsTab.BackgroundColor3, styleTab.BackgroundColor3 = Theme.accent, Theme.panel3
+            end
+        end
+
+        local information = frame(targetsList, {Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = Theme.panel2}, 8)
+        Theme.Stroke(information, Theme.border, 1, 0)
+        label(information, {Size = UDim2.new(1, -24, 1, -8), Position = UDim2.new(0, 12, 0, 4), Text = t("esp_local_only"), TextSize = 9, TextColor3 = Theme.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Center})
+        local _, masterToggle = Theme.OptionRow(targetsList, t("esp_master"), t("esp_master_desc"), function(active)
+            if Esp and Esp.SetMaster then Esp:SetMaster(active) else State.espMasterEnabled = active end
+            updateVisuals()
+        end, lucide.target)
+        local _, createdAdvancedToggle = Theme.OptionRow(targetsList, t("esp_advanced_mode"), t("esp_advanced_mode_desc"), function(active)
+            State.espAdvancedMode = active
+            applyAdvancedVisibility()
+            saveSoon()
+        end, lucide.settings)
+        advancedToggle = createdAdvancedToggle
+
+        local typeOrder = (Esp and Esp.TypeOrder) or {"fruit", "islands", "players", "bosses", "chests", "race_v2", "berries", "haki", "special"}
+        for _, typeName in ipairs(typeOrder) do
+            local currentType = typeName
+            local settings = State.espTypes[currentType]
+            title(targetsList, t("esp_type_" .. currentType), "")
+            local controls = {settings = settings}
+            local typeLabel = t("esp_type_" .. currentType)
+            local _, enabled = Theme.OptionRow(targetsList, t("esp_enable_type", typeLabel), t("esp_enable_type_desc", typeLabel), function(active)
+                settings.enabled = active
+                updateVisuals()
+            end, lucide.target)
+            controls.enabled = enabled
+            controls.color = colorRow(targetsList, settings)
+            advancedRows[#advancedRows + 1] = controls.color.row
+            local options = {
+                {"showName", "esp_show_name", "esp_show_name_desc"}, {"showDistance", "esp_show_distance", "esp_show_distance_desc"},
+                {"showHealth", "esp_show_health", "esp_show_health_desc"}, {"highlight", "esp_highlight", "esp_highlight_desc"},
+                {"box", "esp_box", "esp_box_desc"}, {"tracer", "esp_tracer", "esp_tracer_desc"},
+            }
+            controls.options = {}
+            for _, option in ipairs(options) do
+                local key = option[1]
+                local optionRow, toggle = Theme.OptionRow(targetsList, t(option[2]), t(option[3]), function(active)
+                    settings[key] = active
+                    updateVisuals()
+                end, key == "highlight" and lucide.accent or (key == "tracer" and lucide.target or nil))
+                controls.options[key] = toggle
+                advancedRows[#advancedRows + 1] = optionRow
+            end
+            typeControls[currentType] = controls
+        end
+
+        title(styleList, t("esp_style"), t("esp_local_only"))
+        styleControls.maximum = numberRow(styleList, t("esp_max_distance"), t("esp_max_distance_desc"), 0, 30000, State.espMaxDistance, function(value)
+            return value <= 0 and t("esp_unlimited") or (tostring(math.floor(value)) .. " studs")
+        end, function(value)
+            State.espMaxDistance = math.floor(value); updateVisuals(); return State.espMaxDistance
+        end)
+        styleControls.textSize = numberRow(styleList, t("esp_text_size"), t("esp_text_size_desc"), 8, 28, State.espTextSize, function(value) return tostring(math.floor(value)) .. " px" end, function(value)
+            State.espTextSize = math.floor(value); updateVisuals(); return State.espTextSize
+        end)
+        local _, outlineToggle = Theme.OptionRow(styleList, t("esp_text_outline"), t("esp_text_outline_desc"), function(active)
+            State.espTextOutline = active; updateVisuals()
+        end, lucide.accent)
+        styleControls.outlineToggle = outlineToggle
+        styleControls.fill = numberRow(styleList, t("esp_fill_transparency"), t("esp_fill_transparency_desc"), 0, 100, State.espFillTransparency * 100, function(value) return tostring(math.floor(value)) .. "%" end, function(value)
+            State.espFillTransparency = math.floor(value) / 100; updateVisuals(); return State.espFillTransparency * 100
+        end)
+        styleControls.outline = numberRow(styleList, t("esp_outline_transparency"), t("esp_outline_transparency_desc"), 0, 100, State.espOutlineTransparency * 100, function(value) return tostring(math.floor(value)) .. "%" end, function(value)
+            State.espOutlineTransparency = math.floor(value) / 100; updateVisuals(); return State.espOutlineTransparency * 100
+        end)
+        styleControls.boxThickness = numberRow(styleList, t("esp_box_thickness"), t("esp_box_thickness_desc"), 1, 8, State.espBoxThickness, function(value) return tostring(math.floor(value)) end, function(value)
+            State.espBoxThickness = math.floor(value); updateVisuals(); return State.espBoxThickness
+        end)
+        styleControls.boxTransparency = numberRow(styleList, t("esp_box_transparency"), t("esp_box_transparency_desc"), 0, 100, State.espBoxTransparency * 100, function(value) return tostring(math.floor(value)) .. "%" end, function(value)
+            State.espBoxTransparency = math.floor(value) / 100; updateVisuals(); return State.espBoxTransparency * 100
+        end)
+        styleControls.tracerThickness = numberRow(styleList, t("esp_tracer_thickness"), t("esp_tracer_thickness_desc"), 1, 6, State.espTracerThickness, function(value) return tostring(math.floor(value)) .. " px" end, function(value)
+            State.espTracerThickness = math.floor(value); updateVisuals(); return State.espTracerThickness
+        end)
+        styleControls.tracerTransparency = numberRow(styleList, t("esp_tracer_transparency"), t("esp_tracer_transparency_desc"), 0, 95, State.espTracerTransparency * 100, function(value) return tostring(math.floor(value)) .. "%" end, function(value)
+            State.espTracerTransparency = math.floor(value) / 100; updateVisuals(); return State.espTracerTransparency * 100
+        end)
+        local originRow = frame(styleList, {Size = UDim2.new(1, 0, 0, 56), BackgroundColor3 = Theme.panel2}, 8)
+        Theme.Stroke(originRow, Theme.border, 1, 0)
+        frame(originRow, {Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8), BackgroundColor3 = Theme.accent}, 2)
+        label(originRow, {Size = UDim2.new(1, -165, 0, 18), Position = UDim2.new(0, 13, 0, 9), Text = t("esp_tracer_origin"), TextSize = 12, Font = Enum.Font.GothamBold})
+        label(originRow, {Size = UDim2.new(1, -165, 0, 16), Position = UDim2.new(0, 13, 0, 30), Text = t("esp_tracer_origin_desc"), TextSize = 9, TextColor3 = Theme.muted, TextTruncate = Enum.TextTruncate.AtEnd})
+        local originButton = button(originRow, "", Theme.panel3, 7)
+        originButton.Size = UDim2.new(0, 128, 0, 26)
+        originButton.Position = UDim2.new(1, -140, 0.5, -13)
+        originButton.MouseButton1Click:Connect(function()
+            State.espTracerOrigin = State.espTracerOrigin == "bottom" and "center" or "bottom"
+            updateVisuals()
+        end)
+        styleControls.originButton = originButton
+        styleControls.interval = numberRow(styleList, t("esp_refresh_rate"), t("esp_refresh_rate_desc"), 20, 300, State.espRefreshInterval * 100, function(value) return string.format("%.2fs", value / 100) end, function(value)
+            State.espRefreshInterval = math.floor(value) / 100; updateVisuals(); return State.espRefreshInterval * 100
+        end)
+
+        local function refresh()
+            masterToggle:Set(State.espMasterEnabled == true, true)
+            advancedToggle:Set(State.espAdvancedMode == true, true)
+            applyAdvancedVisibility()
+            for _, controls in pairs(typeControls) do
+                local settings = controls.settings
+                controls.enabled:Set(settings.enabled == true, true)
+                controls.color.refresh()
+                for key, control in pairs(controls.options) do control:Set(settings[key] == true, true) end
+            end
+            styleControls.maximum.control:Set(State.espMaxDistance, true); styleControls.maximum.value.Text = styleControls.maximum.formatter(State.espMaxDistance)
+            styleControls.textSize.control:Set(State.espTextSize, true); styleControls.textSize.value.Text = styleControls.textSize.formatter(State.espTextSize)
+            styleControls.outlineToggle:Set(State.espTextOutline ~= false, true)
+            for _, spec in ipairs({
+                {styleControls.fill, State.espFillTransparency * 100}, {styleControls.outline, State.espOutlineTransparency * 100},
+                {styleControls.boxThickness, State.espBoxThickness}, {styleControls.boxTransparency, State.espBoxTransparency * 100},
+                {styleControls.tracerThickness, State.espTracerThickness}, {styleControls.tracerTransparency, State.espTracerTransparency * 100},
+                {styleControls.interval, State.espRefreshInterval * 100},
+            }) do spec[1].control:Set(spec[2], true); spec[1].value.Text = spec[1].formatter(spec[2]) end
+            originButton.Text = State.espTracerOrigin == "center" and t("esp_origin_center") or t("esp_origin_bottom")
+            local snapshot = Esp and Esp.GetSnapshot and Esp:GetSnapshot() or {counts = {}}
+            local count = 0
+            for _, value in pairs(snapshot.counts or {}) do count = count + (tonumber(value) or 0) end
+            status.Text = t("esp_active_targets", count)
+        end
+        local function setTab(name)
+            if name == "style" and State.espAdvancedMode ~= true then name = "targets" end
+            local targets = name == "targets"
+            targetsPage.Visible, stylePage.Visible = targets, not targets
+            targetsTab.BackgroundColor3 = targets and Theme.accent or Theme.panel3
+            styleTab.BackgroundColor3 = targets and Theme.panel3 or Theme.accent
+            refresh()
+        end
+        Flow:Track(targetsTab.MouseButton1Click:Connect(function() setTab("targets") end))
+        Flow:Track(styleTab.MouseButton1Click:Connect(function() setTab("style") end))
+        task.spawn(function()
+            while gui and gui.Parent do
+                task.wait(0.40)
+                if espPage.Visible then refresh() end
+            end
+        end)
+        refresh()
+        return {refresh = refresh}
+    end
+
+    local function buildEventFarmPage(eventFarmPage, gui, lucide, t, setStatus, subButton, sectionHeader)
+        local EventFarm = Flow.Features.EventFarm
+        sectionHeader(eventFarmPage, t("event_farm_title"), "")
+        local list = Theme.New("ScrollingFrame", {
+            Size = UDim2.new(1, 0, 1, -34), Position = UDim2.new(0, 0, 0, 34),
+            BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
+            ScrollBarImageColor3 = Theme.accent, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            CanvasSize = UDim2.new(), Parent = eventFarmPage,
+        })
+        local layout = Instance.new("UIListLayout")
+        layout.Padding = UDim.new(0, 7)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = list
+        local padding = Instance.new("UIPadding")
+        padding.PaddingRight = UDim.new(0, 5)
+        padding.PaddingBottom = UDim.new(0, 8)
+        padding.Parent = list
+
+        local function selectionRow(title, iconAssetPath)
+            local row = frame(list, {Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = Theme.panel2}, 8)
+            Theme.Stroke(row, Theme.border, 1, 0)
+            frame(row, {Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8), BackgroundColor3 = Theme.accent}, 2)
+            if iconAssetPath and iconAssetPath ~= "" then
+                Theme.New("ImageLabel", {Size = UDim2.new(0, 15, 0, 15), Position = UDim2.new(0, 12, 0, 10), BackgroundTransparency = 1, Image = iconAssetPath, ImageColor3 = Theme.accent2, ScaleType = Enum.ScaleType.Fit, Parent = row})
+            end
+            label(row, {Size = UDim2.new(1, -44, 0, 17), Position = UDim2.new(0, iconAssetPath and 34 or 12, 0, 7), Text = title, TextSize = 11, Font = Enum.Font.GothamBold})
+            -- The current value is the control itself. Clicking this compact
+            -- field opens a small tray immediately below this selection; there
+            -- is no modal and no separate generic "CHANGE" button.
+            local field = button(row, t("event_farm_no_selection"), Theme.panel3, 6, "")
+            field.Size = UDim2.new(1, -24, 0, 25)
+            field.Position = UDim2.new(0, 12, 0, 30)
+            field.TextSize = 9
+            field.TextXAlignment = Enum.TextXAlignment.Left
+            return field
+        end
+
+        local function selectionTray()
+            local tray = frame(list, {Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Theme.panel3, Visible = false}, 8)
+            Theme.Stroke(tray, Theme.border, 1, 0)
+            local title = label(tray, {Size = UDim2.new(1, -22, 0, 21), Position = UDim2.new(0, 11, 0, 6), Text = "", TextSize = 9, Font = Enum.Font.GothamBold, TextColor3 = Theme.accent2})
+            local scroll = Theme.New("ScrollingFrame", {Size = UDim2.new(1, -14, 1, -34), Position = UDim2.new(0, 7, 0, 28), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), Parent = tray})
+            local trayLayout = Instance.new("UIListLayout")
+            trayLayout.Padding = UDim.new(0, 4)
+            trayLayout.Parent = scroll
+            return {frame = tray, title = title, scroll = scroll}
+        end
+
+        local statusRow = frame(list, {Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Theme.panel2}, 8)
+        Theme.Stroke(statusRow, Theme.border, 1, 0)
+        label(statusRow, {Size = UDim2.new(0, 92, 1, 0), Position = UDim2.new(0, 12, 0, 0), Text = t("event_farm_status"), TextSize = 10, Font = Enum.Font.GothamBold})
+        local statusValue = label(statusRow, {Size = UDim2.new(1, -116, 1, 0), Position = UDim2.new(0, 104, 0, 0), Text = t("idle"), TextSize = 9, TextColor3 = Theme.muted, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd})
+
+        local _, autoToggle = Theme.OptionRow(list, t("auto_farm_events"), t("auto_farm_events_desc"), function(active)
+            if not EventFarm then return end
+            local ok, reason = EventFarm:SetEnabled(active)
+            if not ok then
+                autoToggle:Set(false, true)
+                setStatus(t("fail") .. ": " .. tostring(reason), Theme.danger)
+            else
+                setStatus(active and t("active") or t("idle"), active and Theme.success or Theme.muted)
+            end
+        end, lucide.maritime or lucide.mobs)
+
+        local boatField = selectionRow(t("event_farm_boat"), lucide.maritime)
+        local boatTray = selectionTray()
+        local eventField = selectionRow(t("event_farm_event"), lucide.target)
+        local eventTray = selectionTray()
+        local _, vortexToggle = Theme.OptionRow(list, t("event_farm_vortex"), t("event_farm_vortex_desc"), function(active)
+            if EventFarm then EventFarm:SetVortexEvade(active) end
+        end, lucide.accent or lucide.activity)
+        local _, moveBoatToggle = Theme.OptionRow(list, t("event_farm_move_boat"), t("event_farm_move_boat_desc"), function(active)
+            if EventFarm then EventFarm:SetMoveBoatAway(active) end
+        end, lucide.maritime or lucide.speed)
+
+        local activeTray = nil
+        local function hideTray(tray)
+            tray.frame.Visible = false
+            tray.frame.Size = UDim2.new(1, 0, 0, 0)
+        end
+        local function clearChoices(tray)
+            for _, child in ipairs(tray.scroll:GetChildren()) do
+                if child:IsA("GuiObject") then child:Destroy() end
+            end
+        end
+        local function showChoices(kind, tray)
+            if activeTray == tray and tray.frame.Visible then
+                hideTray(tray)
+                activeTray = nil
+                return
+            end
+            if activeTray then hideTray(activeTray) end
+            activeTray = tray
+            clearChoices(tray)
+            local entries = kind == "boat" and (EventFarm and EventFarm:GetBoats() or {}) or (EventFarm and EventFarm:GetSupportedEvents() or {})
+            tray.title.Text = kind == "boat" and t("event_farm_choose_boat") or t("event_farm_choose_event")
+            if #entries == 0 then
+                label(tray.scroll, {Size = UDim2.new(1, -4, 0, 28), Text = kind == "boat" and t("event_farm_no_boats") or t("event_farm_no_selection"), TextSize = 9, TextColor3 = Theme.muted, TextWrapped = true})
+            else
+                for _, item in ipairs(entries) do
+                    local primary = kind == "boat" and item.display or item.name
+                    local identifier = kind == "boat" and item.name or item.id
+                    local extra = ""
+                    if kind == "boat" then
+                        if item.cost then extra = " · $" .. tostring(item.cost) end
+                        if item.display ~= item.name then extra = extra .. " · " .. item.name end
+                    end
+                    local entry = button(tray.scroll, primary .. extra, Theme.panel2, 6, "")
+                    entry.Size = UDim2.new(1, -4, 0, 27)
+                    entry.TextSize = 9
+                    entry.TextXAlignment = Enum.TextXAlignment.Left
+                    Flow:Track(entry.MouseButton1Click:Connect(function()
+                        local ok, reason
+                        if kind == "boat" then ok, reason = EventFarm:SetBoat(identifier) else ok, reason = EventFarm:SetEvent(identifier) end
+                        if ok then
+                            hideTray(tray)
+                            activeTray = nil
+                            setStatus(t("saved"), Theme.success)
+                        else
+                            setStatus(t("fail") .. ": " .. tostring(reason), Theme.danger)
+                        end
+                    end))
+                end
+            end
+            tray.frame.Visible = true
+            -- A compact expandable tray: it scrolls internally when the live
+            -- catalogue is larger than four choices.
+            tray.frame.Size = UDim2.new(1, 0, 0, math.min(150, 36 + (#entries * 31)))
+        end
+        Flow:Track(boatField.MouseButton1Click:Connect(function() showChoices("boat", boatTray) end))
+        Flow:Track(eventField.MouseButton1Click:Connect(function() showChoices("event", eventTray) end))
+
+        local function refresh()
+            if not EventFarm then
+                statusValue.Text = t("fail")
+                return
+            end
+            local snapshot = EventFarm:GetSnapshot()
+            local boatName = State.eventFarmBoat
+            boatField.Text = boatName ~= "" and boatName or t("event_farm_no_selection")
+            local targetName = State.eventFarmTarget == "terror_shark" and t("terror_shark") or t("event_farm_no_selection")
+            eventField.Text = targetName
+            vortexToggle.Frame.Parent.Visible = State.eventFarmTarget == "terror_shark"
+            moveBoatToggle.Frame.Parent.Visible = State.eventFarmTarget == "terror_shark"
+            autoToggle:Set(snapshot.enabled, true)
+            vortexToggle:Set(State.eventFarmVortexEvade == true, true)
+            moveBoatToggle:Set(State.eventFarmMoveBoatAway == true, true)
+            local phase = tostring(snapshot.phase or "idle")
+            if snapshot.enabled then
+                local altitude = tonumber(snapshot.lift) or 0
+                statusValue.Text = phase .. " · +" .. string.format("%.0f", altitude)
+                statusValue.TextColor3 = Theme.success
+            else
+                statusValue.Text = phase == "idle" and t("idle") or phase
+                statusValue.TextColor3 = Theme.muted
+            end
+        end
+        task.spawn(function()
+            while gui and gui.Parent do
+                task.wait(0.35)
+                if eventFarmPage.Visible then refresh() end
+            end
+        end)
+        refresh()
+        return {refresh = refresh}
     end
 
     local function buildFarmPage(farmHubPage, gui, lucide, t, setStatus, subButton, sectionHeader)
@@ -13752,6 +18282,7 @@ refreshFarmUI()
         local travelHubPage = page("travel")
         local farmHubPage = page("farm")
         local seaEventsHubPage = page("sea_events")
+        page("esp")
         local statusHubPage = page("status")
         local miscHubPage = page("misc")
         local settingsPage = page("settings")
@@ -13829,9 +18360,10 @@ refreshFarmUI()
         navButton("travel", lucide.travel, t("travel"), 1)
         navButton("farm", lucide.mobs, t("farm"), 2)
         navButton("sea_events", lucide.maritime, t("sea_events"), 3)
-        navButton("status", lucide.status, t("status"), 4)
-        navButton("misc", lucide.misc, t("misc"), 5)
-        navButton("settings", lucide.settings, t("settings"), 6)
+        navButton("esp", lucide.target, t("esp"), 4)
+        navButton("status", lucide.status, t("status"), 5)
+        navButton("misc", lucide.misc, t("misc"), 6)
+        navButton("settings", lucide.settings, t("settings"), 7)
 
         local function sectionHeader(parent, title, subtitle)
             frame(parent, {
@@ -13929,11 +18461,14 @@ refreshFarmUI()
             Parent = travelHubPage,
         })
 
-        -- The event page has a single General view and only contains researched
-        -- maritime events/islands. Every card uses title, live-state badge,
-        -- state line and meaningful detail (distance/ETA/position when known).
+        -- General remains read-only travel/status. BoatLocal is still manual
+        -- only; the separate Farm tab owns its temporary native automation.
         sectionHeader(seaEventsHubPage, t("sea_events"), "")
-        local generalEventsTab = subButton(seaEventsHubPage, t("general"), 0, 82)
+        local generalEventsTab = subButton(seaEventsHubPage, t("general"), 0, 72)
+        pages.seaBoat = {}
+        pages.seaBoat.tab = subButton(seaEventsHubPage, t("boat_local"), 78, 112)
+        pages.seaFarm = {}
+        pages.seaFarm.tab = subButton(seaEventsHubPage, t("event_farm"), 196, 82)
         generalEventsTab.BackgroundColor3 = Theme.accent
         local generalEventsPage = Theme.New("ScrollingFrame", {
             Size = UDim2.new(1, 0, 1, -70),
@@ -13953,6 +18488,14 @@ refreshFarmUI()
         generalEventsPadding.PaddingRight = UDim.new(0, 5)
         generalEventsPadding.PaddingBottom = UDim.new(0, 6)
         generalEventsPadding.Parent = generalEventsPage
+        pages.seaBoat.page = Theme.New("Frame", {
+            Size = UDim2.new(1, 0, 1, -70), Position = UDim2.new(0, 0, 0, 70),
+            BackgroundTransparency = 1, Visible = false, Parent = seaEventsHubPage,
+        })
+        pages.seaFarm.page = Theme.New("Frame", {
+            Size = UDim2.new(1, 0, 1, -70), Position = UDim2.new(0, 0, 0, 70),
+            BackgroundTransparency = 1, Visible = false, Parent = seaEventsHubPage,
+        })
 
         local function worldEventCard(title, actionTitle, actionCallback)
             local row = frame(generalEventsPage, {
@@ -14338,6 +18881,24 @@ refreshFarmUI()
             status.Text = tostring(message)
             status.TextColor3 = color or Theme.muted
         end
+        pages.seaBoat.controls = buildBoatLocalPage(pages.seaBoat.page, gui, lucide, t, setStatus, subButton, sectionHeader)
+        pages.seaFarm.controls = buildEventFarmPage(pages.seaFarm.page, gui, lucide, t, setStatus, subButton, sectionHeader)
+        pages.espControls = buildEspPage(pages.esp, gui, lucide, t, setStatus, subButton, sectionHeader)
+        pages.seaBoat.setTab = function(name)
+            local general = name == "general"
+            local boat = name == "boat"
+            generalEventsPage.Visible = general
+            pages.seaBoat.page.Visible = boat
+            pages.seaFarm.page.Visible = name == "farm"
+            generalEventsTab.BackgroundColor3 = general and Theme.accent or Theme.panel3
+            pages.seaBoat.tab.BackgroundColor3 = boat and Theme.accent or Theme.panel3
+            pages.seaFarm.tab.BackgroundColor3 = name == "farm" and Theme.accent or Theme.panel3
+            if boat and pages.seaBoat.controls and pages.seaBoat.controls.refresh then pages.seaBoat.controls.refresh() end
+            if name == "farm" and pages.seaFarm.controls and pages.seaFarm.controls.refresh then pages.seaFarm.controls.refresh() end
+        end
+        Flow:Track(generalEventsTab.MouseButton1Click:Connect(function() pages.seaBoat.setTab("general") end))
+        Flow:Track(pages.seaBoat.tab.MouseButton1Click:Connect(function() pages.seaBoat.setTab("boat") end))
+        Flow:Track(pages.seaFarm.tab.MouseButton1Click:Connect(function() pages.seaBoat.setTab("farm") end))
         farmControls = buildFarmPage(farmHubPage, gui, lucide, t, setStatus, subButton, sectionHeader)
         Flow.Runtime.raidControls = buildRaidPage(pages.raidSubPage, gui, lucide, t, setStatus)
 
@@ -15718,6 +20279,7 @@ refreshFarmUI()
                 farmControls.refresh()
             end
             if Flow.Runtime.raidControls and Flow.Runtime.raidControls.refresh then Flow.Runtime.raidControls.refresh() end
+            if pages.espControls and pages.espControls.refresh then pages.espControls.refresh() end
             fallbackToggle:Set(State.directFallback, true)
             if Flow.Runtime.antiWaterToggle then Flow.Runtime.antiWaterToggle:Set(State.antiWaterEnabled, true) end
             if Flow.Runtime.antiImpassableToggle then Flow.Runtime.antiImpassableToggle:Set(State.antiImpassableEnabled, true) end
@@ -15763,6 +20325,7 @@ refreshFarmUI()
             travelHubPage.Visible = name == "travel"
             farmHubPage.Visible = name == "farm"
             seaEventsHubPage.Visible = name == "sea_events"
+            pages.esp.Visible = name == "esp"
             statusHubPage.Visible = name == "status"
             miscHubPage.Visible = name == "misc"
             settingsPage.Visible = name == "settings"
@@ -15789,6 +20352,9 @@ refreshFarmUI()
                 refreshServerInfo()
             end
             if name == "farm" and farmControls then farmControls.refresh() end
+            if name == "sea_events" and pages.seaBoat.controls and pages.seaBoat.controls.refresh then pages.seaBoat.controls.refresh() end
+            if name == "sea_events" and pages.seaFarm and pages.seaFarm.controls and pages.seaFarm.controls.refresh then pages.seaFarm.controls.refresh() end
+            if name == "esp" and pages.espControls and pages.espControls.refresh then pages.espControls.refresh() end
             if name == "sea_events" or name == "status" then refreshLiveStatus() end
         end
 
@@ -15974,6 +20540,10 @@ end)(Flow)
     -- are off or no eligible equipped Melee/Sword is present.
     local autoCombat = Flow.Features.AutoCombat
     if autoCombat and autoCombat.Start then pcall(function() autoCombat:Start() end) end
+    -- Local Boat remains idle until the player sits in their own root boat seat;
+    -- masters are off by default and every changed property is restored on close.
+    local boatLocal = Flow.Features.BoatLocal
+    if boatLocal and boatLocal.Start then pcall(function() boatLocal:Start() end) end
     local gui, reason = Flow.UI:Create()
     if not gui then
         error(Flow.Language:T("ui_start_failed", tostring(reason)))
